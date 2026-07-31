@@ -95,6 +95,15 @@ pub(crate) struct UsageUpdatePayload {
     /// Do NOT use `#[serde(default)]` here — that would collapse the absent
     /// case into `Some(0)` and destroy provenance in the append-only archive.
     pub accumulated_cached_input_tokens: Option<u64>,
+    /// The cache-written subset of `accumulated_input_tokens`.
+    ///
+    /// `None` when the harness did not include the field (e.g. goose or any
+    /// provider that does not report cache-write tokens). `Some(0)` when the
+    /// harness explicitly reported zero cache writes. Same absence-vs-zero
+    /// semantics as `accumulated_cached_input_tokens` above.
+    ///
+    /// Do NOT use `#[serde(default)]` here for the same reason.
+    pub accumulated_cache_write_tokens: Option<u64>,
     pub accumulated_cost: Option<f64>,
     /// Session-cumulative genuine provider total tokens. Optional — only
     /// emitted by buzz-agent when every turn in the session so far supplied a
@@ -108,6 +117,15 @@ pub(crate) struct UsageUpdatePayload {
     /// predate this field deserialize cleanly as `None`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Billing identity as stamped by the publisher. Optional — absent when
+    /// the publisher could not prove applicability (unrecognised endpoint,
+    /// mixed identities within the turn, etc.). Old harnesses that do not emit
+    /// this field deserialise to `None` cleanly via `#[serde(default)]`.
+    ///
+    /// Do NOT use this value directly to advance the session-cumulative
+    /// baseline: it is per-turn only and must not persist to `SessionState`.
+    #[serde(default)]
+    pub pricing_identity: Option<buzz_core::agent_turn_metric::PricingIdentity>,
 }
 
 /// Per-session normalization state: the last cumulative snapshot we saw.
@@ -135,6 +153,10 @@ struct SessionState {
     /// a decrease in this counter taints only the cache-read delta, not
     /// `delta_reliable` or the input/output deltas.
     last_cached_input: Option<u64>,
+    /// Cumulative cache-write tokens at the end of the LAST PUBLISHED turn.
+    /// `None` when the harness has never reported this field. Field-local:
+    /// a decrease taints only the cache-write delta, not `delta_reliable`.
+    last_cache_write: Option<u64>,
 }
 
 /// Per-turn usage record exposed to `TurnCompletionGuard` for NIP-AM publishing.
@@ -167,6 +189,10 @@ pub struct TurnUsage {
     /// a decrease here never flips `delta_reliable` or invalidates the
     /// input/output deltas.
     pub turn_cache_read_tokens: Option<u64>,
+    /// Per-turn cache-write token delta (`current − previous`); `None` when no
+    /// baseline exists, either snapshot is `None`, or the counter decreased.
+    /// Field-local — same contract as `turn_cache_read_tokens`.
+    pub turn_cache_write_tokens: Option<u64>,
     /// Session-cumulative input tokens as reported by goose at end of turn.
     pub cumulative_input_tokens: u64,
     /// Session-cumulative output tokens as reported by goose at end of turn.
@@ -181,9 +207,17 @@ pub struct TurnUsage {
     /// any harness that omits `accumulatedCachedInputTokens`).
     /// `Some(0)` when the harness reported zero cache hits.
     pub cumulative_cache_read_tokens: Option<u64>,
+    /// Session-cumulative cache-write tokens as reported by buzz-agent.
+    /// `None` when the harness has never reported this field.
+    /// `Some(0)` when the harness reported zero cache writes.
+    pub cumulative_cache_write_tokens: Option<u64>,
     /// Effective model id for this turn (maps to NIP-AM `model`). `None` if the
     /// harness did not include the model in its usage notification.
     pub model: Option<String>,
+    /// Billing identity for this turn, as received from the publisher.
+    /// `None` when the publisher omitted it (unrecognised endpoint, mixed
+    /// identities, old harness). Per-turn only — not session-cumulative.
+    pub pricing_identity: Option<buzz_core::agent_turn_metric::PricingIdentity>,
 }
 
 /// Tracks per-session cumulative usage state across turns.
@@ -217,6 +251,17 @@ pub(crate) struct UsageTracker {
     in_flight_session: Option<String>,
     /// The most recently computed turn usage, ready for `take()`.
     pending: Option<TurnUsage>,
+    /// Per-in-flight-turn identity accumulator — three-state:
+    ///   `None`             = no usage notification yet (initial / after begin_turn)
+    ///   `Some(Some(pi))`   = all notifications so far carry the same proven identity
+    ///   `Some(None)`       = poisoned (mismatch, absent on a token-advancing
+    ///                        notification, or first notification had no identity)
+    ///
+    /// Folded on every in-flight `record()` call (last-update-wins is the
+    /// wrong contract for cumulative-snapshot notifications — a later
+    /// notification that carries A after an unproven/absent one must NOT
+    /// resurrect the identity). Reset to `None` in `begin_turn()` and `take()`.
+    pending_identity: Option<Option<buzz_core::agent_turn_metric::PricingIdentity>>,
 }
 
 impl UsageTracker {
@@ -229,6 +274,7 @@ impl UsageTracker {
     pub(crate) fn begin_turn(&mut self, session_id: &str) {
         self.in_flight_session = Some(session_id.to_string());
         self.pending = None;
+        self.pending_identity = None;
     }
 
     /// Process a `usage_update` notification payload.
@@ -261,6 +307,7 @@ impl UsageTracker {
         let current_cost = payload.accumulated_cost;
         let current_total = payload.accumulated_total_tokens;
         let current_cached_input = payload.accumulated_cached_input_tokens;
+        let current_cache_write = payload.accumulated_cache_write_tokens;
 
         // Determine whether this session is currently in-flight so we know
         // whether to set `pending`. We compute the delta regardless so that
@@ -331,9 +378,46 @@ impl UsageTracker {
             None => None, // no baseline yet
         };
 
+        // Cache-write token delta: same field-local contract as cache-read.
+        let turn_cache_write = match self.sessions.get(session_id) {
+            Some(prev) => match (current_cache_write, prev.last_cache_write) {
+                (Some(cur), Some(p)) if cur >= p => Some(cur - p),
+                (Some(_), Some(_)) => None, // decrease → field-local taint
+                _ => None,                  // either snapshot absent → no delta
+            },
+            None => None, // no baseline yet
+        };
+
         if is_in_flight {
             // In-flight-match: update pending with the latest cumulative values.
             // Baseline is NOT advanced here — it advances only on take().
+            //
+            // Fold the per-notification identity into the per-turn accumulator.
+            // Last-update-wins is wrong for cumulative-snapshot notifications: a
+            // later notification that carries a proven identity A after an
+            // absent/unproven one must NOT resurrect the identity.
+            //
+            // Fold contract (mirrors the publisher-side `fold_pricing_identity`):
+            // - `None` acc (first notification): adopt whatever the payload carries.
+            // - `Some(Some(pi))` acc: if this notification matches exactly, keep;
+            //   otherwise poison to `Some(None)`.
+            // - `Some(None)` acc (poisoned): stays poisoned, no healing.
+            let incoming = payload.pricing_identity.clone();
+            self.pending_identity = match self.pending_identity.take() {
+                // First in-flight notification: adopt the payload identity.
+                None => Some(incoming),
+                // Already consistent: keep only if this notification matches exactly.
+                Some(Some(ref existing)) => {
+                    if Some(existing) == incoming.as_ref() {
+                        Some(incoming)
+                    } else {
+                        // Mismatch (different identity, absent, or unproven) → poison.
+                        Some(None)
+                    }
+                }
+                // Already poisoned: stays poisoned regardless of this notification.
+                poisoned @ Some(None) => poisoned,
+            };
             self.pending = Some(TurnUsage {
                 session_id: session_id.to_string(),
                 turn_seq,
@@ -343,12 +427,17 @@ impl UsageTracker {
                 turn_total_tokens: turn_total,
                 turn_cost_usd: turn_cost,
                 turn_cache_read_tokens: turn_cache_read,
+                turn_cache_write_tokens: turn_cache_write,
                 cumulative_input_tokens: current_input,
                 cumulative_output_tokens: current_output,
                 cumulative_total_tokens: current_total,
                 cumulative_cost_usd: current_cost,
                 cumulative_cache_read_tokens: current_cached_input,
+                cumulative_cache_write_tokens: current_cache_write,
                 model: payload.model.clone(),
+                // The folded identity is written in take() — use a placeholder
+                // here and replace it before returning the record.
+                pricing_identity: None,
             });
         } else if self.in_flight_session.is_none() {
             // Not in-flight at all: advance the committed baseline so the next
@@ -367,12 +456,48 @@ impl UsageTracker {
                     last_cost: current_cost,
                     last_total: current_total,
                     last_cached_input: current_cached_input,
+                    last_cache_write: current_cache_write,
                 },
             );
         }
         // else: in-flight-for-another-session — ignore. A late notification
         // for session X while session Y is in-flight must NOT advance X's
         // committed baseline; doing so would undercount X's next published delta.
+    }
+
+    /// Seed a zero baseline for a session that buzz-acp just spawned.
+    ///
+    /// When buzz-acp creates a session itself via `session/new`, the session's
+    /// prior token usage is zero by definition — no provider calls have been
+    /// made yet.  Seeding a zero baseline here means the first usage
+    /// notification for this session will see `current − 0 == cumulative` and
+    /// can emit `delta_reliable: true` with `turn.* == cumulative.*`.
+    ///
+    /// This must be called **only** from the code path that issues `session/new`
+    /// (i.e. `create_session_and_apply_model` in `pool.rs`).  It must **not** be
+    /// called when attaching to a pre-existing session whose prior usage is
+    /// genuinely unknown — that case correctly stays fail-closed with the
+    /// existing no-baseline behavior.
+    ///
+    /// No-op if a baseline for this session already exists (guards against
+    /// accidental double-seeding across session rotation).
+    pub(crate) fn seed_zero_baseline(&mut self, session_id: &str) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_insert(SessionState {
+                published_seq: 0,
+                last_input: 0,
+                last_output: 0,
+                last_cost: Some(0.0),
+                // At spawn all counters are zero — seed known-zero baselines so
+                // the first real turn delta is computed exactly, not discarded as
+                // "no prior baseline".  Cache values use the same argument as
+                // input/output: a freshly-spawned session has accumulated nothing,
+                // so the provider-reported cumulative IS the turn delta.
+                last_total: Some(0),
+                last_cached_input: Some(0),
+                last_cache_write: Some(0),
+            });
     }
 
     /// Consume and return the most recently computed turn usage record, then
@@ -384,7 +509,12 @@ impl UsageTracker {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take(&mut self) -> Option<TurnUsage> {
         self.in_flight_session = None;
-        let record = self.pending.take()?;
+        // Consume the folded identity accumulator: emit the proven identity when
+        // every in-flight notification carried the same one; emit `None` when
+        // any notification was absent/unproven or they disagreed.
+        let folded_identity = self.pending_identity.take().and_then(|inner| inner);
+        let mut record = self.pending.take()?;
+        record.pricing_identity = folded_identity;
         // Advance the committed baseline to this published record so the
         // *next* turn measures its delta from here.
         self.sessions.insert(
@@ -396,6 +526,7 @@ impl UsageTracker {
                 last_cost: record.cumulative_cost_usd,
                 last_total: record.cumulative_total_tokens,
                 last_cached_input: record.cumulative_cache_read_tokens,
+                last_cache_write: record.cumulative_cache_write_tokens,
             },
         );
         Some(record)
@@ -466,9 +597,11 @@ mod tests {
             accumulated_input_tokens: input,
             accumulated_output_tokens: output,
             accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
             accumulated_cost: cost,
             accumulated_total_tokens: None,
             model: None,
+            pricing_identity: None,
         }
     }
 
@@ -479,9 +612,11 @@ mod tests {
             accumulated_input_tokens: input,
             accumulated_output_tokens: output,
             accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
             accumulated_cost: cost,
             accumulated_total_tokens: None,
             model: None,
+            pricing_identity: None,
         }
     }
 
@@ -977,9 +1112,11 @@ mod tests {
             accumulated_input_tokens: input,
             accumulated_output_tokens: output,
             accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
             accumulated_cost: cost,
             accumulated_total_tokens: None,
             model: model.map(str::to_string),
+            pricing_identity: None,
         }
     }
 
@@ -1041,9 +1178,11 @@ mod tests {
             accumulated_input_tokens: input,
             accumulated_output_tokens: output,
             accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
             accumulated_cost: None,
             accumulated_total_tokens: total,
             model: None,
+            pricing_identity: None,
         }
     }
 
@@ -1209,9 +1348,11 @@ mod tests {
             accumulated_input_tokens: input,
             accumulated_output_tokens: output,
             accumulated_cached_input_tokens: cached_input,
+            accumulated_cache_write_tokens: None,
             accumulated_cost: None,
             accumulated_total_tokens: None,
             model: None,
+            pricing_identity: None,
         }
     }
 
@@ -1449,12 +1590,15 @@ mod tests {
             turn_total_tokens: None,
             turn_cost_usd: None,
             turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
             cumulative_input_tokens: 700,
             cumulative_output_tokens: 200,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
             cumulative_cache_read_tokens: None, // harness did not report the field
+            cumulative_cache_write_tokens: None,
             model: None,
+            pricing_identity: None,
         };
 
         let (turn_counts, cumulative_counts) = build_turn_metric_counts(&usage);
@@ -1487,12 +1631,15 @@ mod tests {
             turn_total_tokens: None,
             turn_cost_usd: None,
             turn_cache_read_tokens: Some(300),
+            turn_cache_write_tokens: None,
             cumulative_input_tokens: 700,
             cumulative_output_tokens: 200,
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
             cumulative_cache_read_tokens: Some(600),
+            cumulative_cache_write_tokens: None,
             model: None,
+            pricing_identity: None,
         };
 
         let (turn_counts, cumulative_counts) = build_turn_metric_counts(&usage);
@@ -1509,6 +1656,496 @@ mod tests {
             cumulative.cache_read_tokens,
             Some(600),
             "nonzero cumulative cache: must appear in kind:44200 cumulative counts"
+        );
+    }
+
+    // ── seed_zero_baseline / first-turn fix ─────────────────────────────────
+
+    /// (a) Self-spawned session: first notification must be delta_reliable=true,
+    /// turn deltas equal to the cumulative values (baseline was zero).
+    #[test]
+    fn spawned_session_first_turn_is_reliable_with_zero_baseline() {
+        let mut tracker = UsageTracker::default();
+        // Simulate what pool.rs does immediately after create_session_and_apply_model.
+        tracker.seed_zero_baseline("sess-spawned");
+
+        tracker.begin_turn("sess-spawned");
+        tracker.record("sess-spawned", &payload(1000, 200, Some(0.01)));
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            usage.delta_reliable,
+            "spawned session first turn must be reliable"
+        );
+        assert_eq!(usage.turn_seq, 1);
+        // Turn deltas == cumulative (baseline was zero).
+        assert_eq!(usage.turn_input_tokens, Some(1000));
+        assert_eq!(usage.turn_output_tokens, Some(200));
+        let dc = usage.turn_cost_usd.expect("cost delta present");
+        assert!((dc - 0.01).abs() < 1e-9, "cost delta: {dc}");
+        assert_eq!(usage.cumulative_input_tokens, 1000);
+        assert_eq!(usage.cumulative_output_tokens, 200);
+    }
+
+    /// (b) Re-attach session (no seed): first notification must remain
+    /// fail-closed (delta_reliable=false, turn.*=None).
+    #[test]
+    fn reattach_session_first_turn_stays_fail_closed() {
+        let mut tracker = UsageTracker::default();
+        // No seed_zero_baseline call — simulates re-attach to pre-existing session.
+
+        tracker.begin_turn("sess-reattach");
+        tracker.record("sess-reattach", &payload(5000, 1000, Some(0.05)));
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            !usage.delta_reliable,
+            "re-attach first turn must remain fail-closed (delta_reliable=false)"
+        );
+        assert_eq!(usage.turn_seq, 1);
+        assert!(
+            usage.turn_input_tokens.is_none(),
+            "no turn delta on re-attach"
+        );
+        assert!(usage.turn_output_tokens.is_none());
+        assert!(usage.turn_cost_usd.is_none());
+        // Cumulative still passes through.
+        assert_eq!(usage.cumulative_input_tokens, 5000);
+        assert_eq!(usage.cumulative_output_tokens, 1000);
+    }
+
+    /// (c) Second turn and beyond are unaffected in both modes.
+    #[test]
+    fn second_turn_reliable_in_both_spawned_and_reattach_paths() {
+        // Spawned path: turn 2 must be reliable (baseline from turn 1's take()).
+        let mut spawned = UsageTracker::default();
+        spawned.seed_zero_baseline("sess-s");
+        spawned.begin_turn("sess-s");
+        spawned.record("sess-s", &payload(1000, 100, None));
+        let _ = spawned.take();
+
+        spawned.begin_turn("sess-s");
+        spawned.record("sess-s", &payload(1800, 250, None));
+        let t2_s = spawned.take().expect("spawned turn 2");
+        assert!(t2_s.delta_reliable, "spawned path: turn 2 reliable");
+        assert_eq!(t2_s.turn_seq, 2);
+        assert_eq!(t2_s.turn_input_tokens, Some(800));
+        assert_eq!(t2_s.turn_output_tokens, Some(150));
+
+        // Re-attach path: turn 2 must also be reliable.
+        let mut reattach = UsageTracker::default();
+        reattach.begin_turn("sess-r");
+        reattach.record("sess-r", &payload(5000, 1000, None));
+        let _ = reattach.take(); // turn 1: unreliable (no baseline), but take() seeds it
+
+        reattach.begin_turn("sess-r");
+        reattach.record("sess-r", &payload(6000, 1200, None));
+        let t2_r = reattach.take().expect("reattach turn 2");
+        assert!(t2_r.delta_reliable, "re-attach path: turn 2 reliable");
+        assert_eq!(t2_r.turn_seq, 2);
+        assert_eq!(t2_r.turn_input_tokens, Some(1000));
+        assert_eq!(t2_r.turn_output_tokens, Some(200));
+    }
+
+    /// (d) Wire-frame assertions on the emitted TurnUsage payload fields for
+    /// the spawned-session first turn (not just internal delta_reliable).
+    #[test]
+    fn spawned_session_first_turn_payload_fields_are_correct() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-wire");
+
+        tracker.begin_turn("sess-wire");
+        tracker.record(
+            "sess-wire",
+            &UsageUpdatePayload {
+                used: 12345,
+                context_limit: 200_000,
+                accumulated_input_tokens: 10000,
+                accumulated_output_tokens: 2345,
+                accumulated_cached_input_tokens: Some(500),
+                accumulated_cache_write_tokens: None,
+                accumulated_cost: Some(0.042),
+                accumulated_total_tokens: Some(12345),
+                model: Some("claude-opus-4-5".to_string()),
+                pricing_identity: None,
+            },
+        );
+        let usage = tracker.take().expect("pending");
+
+        // Wire payload fields — every field checked.
+        assert_eq!(usage.session_id, "sess-wire");
+        assert_eq!(usage.turn_seq, 1);
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, Some(10000));
+        assert_eq!(usage.turn_output_tokens, Some(2345));
+        // turn_total: cumulative_total(12345) - baseline_total(Some(0)) = 12345.
+        // seed_zero_baseline now seeds last_total = Some(0) — same known-zero
+        // argument as input/output: a freshly-spawned session has accumulated nothing.
+        assert_eq!(
+            usage.turn_total_tokens,
+            Some(12345),
+            "turn_total_tokens must be Some(12345) on seeded first turn (baseline = Some(0))"
+        );
+        let dc = usage.turn_cost_usd.expect("cost delta present");
+        assert!((dc - 0.042).abs() < 1e-9, "cost delta: {dc}");
+        assert_eq!(usage.cumulative_input_tokens, 10000);
+        assert_eq!(usage.cumulative_output_tokens, 2345);
+        assert_eq!(usage.cumulative_total_tokens, Some(12345));
+        assert_eq!(usage.cumulative_cost_usd, Some(0.042));
+        assert_eq!(usage.model.as_deref(), Some("claude-opus-4-5"));
+        // Cache: baseline seeded with last_cached_input = Some(0), so first turn
+        // delta = snapshot(500) - baseline(0) = Some(500).
+        assert_eq!(
+            usage.turn_cache_read_tokens,
+            Some(500),
+            "turn_cache_read_tokens: seeded baseline = Some(0) → delta = Some(500)"
+        );
+        assert_eq!(
+            usage.cumulative_cache_read_tokens,
+            Some(500),
+            "cumulative_cache_read_tokens passes through from payload"
+        );
+    }
+
+    /// seed_zero_baseline is a no-op when a baseline already exists — guards
+    /// against accidental double-seeding across session rotation.
+    #[test]
+    fn seed_zero_baseline_is_noop_when_baseline_already_exists() {
+        let mut tracker = UsageTracker::default();
+        // Establish a real baseline via turn 1.
+        tracker.seed_zero_baseline("sess-noop");
+        tracker.begin_turn("sess-noop");
+        tracker.record("sess-noop", &payload(1000, 200, None));
+        let _ = tracker.take();
+
+        // A second seed call (e.g. a bug in pool.rs) must not reset the baseline.
+        tracker.seed_zero_baseline("sess-noop");
+
+        // Turn 2 delta must still measure from the real baseline (1000/200), not zero.
+        tracker.begin_turn("sess-noop");
+        tracker.record("sess-noop", &payload(1500, 300, None));
+        let usage = tracker.take().expect("pending");
+
+        assert!(usage.delta_reliable);
+        assert_eq!(
+            usage.turn_input_tokens,
+            Some(500),
+            "baseline must not have been reset to zero by the second seed call"
+        );
+        assert_eq!(usage.turn_output_tokens, Some(100));
+    }
+
+    // ── PricingIdentity wire threading ──────────────────────────────────────
+
+    fn make_pricing_identity_payload(
+        input: u64,
+        output: u64,
+        authority: &str,
+        model: &str,
+    ) -> UsageUpdatePayload {
+        UsageUpdatePayload {
+            used: input + output,
+            context_limit: 200_000,
+            accumulated_input_tokens: input,
+            accumulated_output_tokens: output,
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: Some(model.to_string()),
+            pricing_identity: Some(buzz_core::agent_turn_metric::PricingIdentity {
+                authority: authority.to_string(),
+                model: model.to_string(),
+                cache_class: None,
+            }),
+        }
+    }
+
+    /// A payload with a well-formed `pricingIdentity` field must thread
+    /// it through to `TurnUsage.pricing_identity`. The field is per-turn
+    /// only (not session-cumulative) and must not affect other deltas.
+    #[test]
+    fn pricing_identity_threads_from_payload_to_turn_usage() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-pi");
+
+        tracker.begin_turn("sess-pi");
+        tracker.record(
+            "sess-pi",
+            &make_pricing_identity_payload(1000, 200, "api.anthropic.com", "claude-opus-4-5"),
+        );
+        let usage = tracker.take().expect("pending");
+
+        let pi = usage
+            .pricing_identity
+            .expect("pricing_identity must be Some");
+        assert_eq!(pi.authority, "api.anthropic.com");
+        assert_eq!(pi.model, "claude-opus-4-5");
+        assert!(pi.cache_class.is_none());
+        // Other fields must be unaffected.
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, Some(1000));
+    }
+
+    /// Old harnesses (goose, older buzz-agent) that do not emit `pricingIdentity`
+    /// must produce `TurnUsage.pricing_identity = None` — no default injection.
+    #[test]
+    fn old_harness_no_pricing_identity_field_yields_none() {
+        // Deserialize a payload with no pricingIdentity field.
+        let raw = serde_json::json!({
+            "used": 1200,
+            "contextLimit": 200_000,
+            "accumulatedInputTokens": 1000,
+            "accumulatedOutputTokens": 200,
+            "model": "claude-opus-4",
+        });
+        let p: UsageUpdatePayload =
+            serde_json::from_value(raw).expect("must deserialize without pricingIdentity field");
+        assert!(
+            p.pricing_identity.is_none(),
+            "old harness compat: absent field must deserialize to None, not inject a default"
+        );
+
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-old");
+        tracker.begin_turn("sess-old");
+        tracker.record("sess-old", &p);
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            usage.pricing_identity.is_none(),
+            "old harness: pricing_identity must be None in TurnUsage"
+        );
+    }
+
+    /// `pricingIdentity` in the JSON wire format uses camelCase keys as
+    /// required by the NIP-AM wire contract (`#[serde(rename_all = "camelCase")]`).
+    #[test]
+    fn pricing_identity_deserializes_from_camel_case_wire_key() {
+        let raw = serde_json::json!({
+            "used": 1500,
+            "contextLimit": 0,
+            "accumulatedInputTokens": 1200,
+            "accumulatedOutputTokens": 300,
+            "pricingIdentity": {
+                "authority": "api.openai.com",
+                "model": "gpt-4o",
+            }
+        });
+        let p: UsageUpdatePayload = serde_json::from_value(raw).expect("payload must deserialize");
+        let pi = p.pricing_identity.expect("pricingIdentity must parse");
+        assert_eq!(pi.authority, "api.openai.com");
+        assert_eq!(pi.model, "gpt-4o");
+        assert!(pi.cache_class.is_none());
+    }
+
+    /// `pricingIdentity` with a `cacheClass` field threads through correctly.
+    #[test]
+    fn pricing_identity_cache_class_threads_through() {
+        let raw = serde_json::json!({
+            "used": 800,
+            "contextLimit": 0,
+            "accumulatedInputTokens": 600,
+            "accumulatedOutputTokens": 200,
+            "pricingIdentity": {
+                "authority": "api.anthropic.com",
+                "model": "claude-3-5-haiku",
+                "cacheClass": "ephemeral",
+            }
+        });
+        let p: UsageUpdatePayload = serde_json::from_value(raw).expect("payload must deserialize");
+        let pi = p.pricing_identity.expect("pricingIdentity must parse");
+        assert_eq!(pi.cache_class.as_deref(), Some("ephemeral"));
+    }
+
+    /// `pricing_identity` is per-turn only — it must NOT be stored in or
+    /// influence the session-cumulative baseline (`SessionState`). A second
+    /// turn must still carry its own `pricing_identity` from the latest payload.
+    #[test]
+    fn pricing_identity_is_not_session_cumulative() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-perturn");
+
+        // Turn 1: identity present.
+        tracker.begin_turn("sess-perturn");
+        tracker.record(
+            "sess-perturn",
+            &make_pricing_identity_payload(1000, 200, "api.anthropic.com", "claude-opus-4-5"),
+        );
+        let t1 = tracker.take().expect("turn 1");
+        assert!(
+            t1.pricing_identity.is_some(),
+            "turn 1 must carry pricing_identity"
+        );
+
+        // Turn 2: no identity in payload.
+        tracker.begin_turn("sess-perturn");
+        tracker.record("sess-perturn", &payload(1500, 300, None));
+        let t2 = tracker.take().expect("turn 2");
+        assert!(
+            t2.pricing_identity.is_none(),
+            "turn 2 must NOT inherit turn 1's pricing_identity"
+        );
+    }
+
+    // ── First-turn cache deltas via seed_zero_baseline ───────────────────────
+    //
+    // When `seed_zero_baseline` is called before the first turn (the normal path
+    // for freshly-spawned sessions), the zero-seeded baselines mean the first
+    // snapshot's cumulative values equal the per-turn deltas — no data is lost.
+
+    #[test]
+    fn seed_zero_baseline_first_turn_cache_read_and_write_produce_exact_deltas() {
+        // A freshly-spawned session seeds last_cached_input = Some(0) and
+        // last_cache_write = Some(0).  The first turn's snapshot values ARE the
+        // deltas; both categories must surface as exact non-None values.
+        let mut tracker = UsageTracker::default();
+
+        // Simulate session spawn: seed before the first turn.
+        tracker.seed_zero_baseline("sess-seed1");
+        tracker.begin_turn("sess-seed1");
+
+        // First snapshot: cache-read = 500, cache-write = 120.
+        let payload = UsageUpdatePayload {
+            used: 1200,
+            context_limit: 200_000,
+            accumulated_input_tokens: 1000,
+            accumulated_output_tokens: 200,
+            accumulated_cached_input_tokens: Some(500),
+            accumulated_cache_write_tokens: Some(120),
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        };
+        tracker.record("sess-seed1", &payload);
+        let usage = tracker
+            .take()
+            .expect("first seeded turn must produce a record");
+
+        // Input/output deltas are always reliable on the seeded path.
+        assert!(
+            usage.delta_reliable,
+            "seeded first turn must be delta_reliable"
+        );
+        assert_eq!(
+            usage.turn_cache_read_tokens,
+            Some(500),
+            "seeded first turn: cache-read delta must equal the snapshot value"
+        );
+        assert_eq!(
+            usage.turn_cache_write_tokens,
+            Some(120),
+            "seeded first turn: cache-write delta must equal the snapshot value"
+        );
+        assert_eq!(
+            usage.cumulative_cache_read_tokens,
+            Some(500),
+            "seeded first turn: cumulative cache-read must pass through"
+        );
+        assert_eq!(
+            usage.cumulative_cache_write_tokens,
+            Some(120),
+            "seeded first turn: cumulative cache-write must pass through"
+        );
+    }
+
+    // ── ACP identity fold across multiple notifications ──────────────────────
+    //
+    // The publisher fold (agent.rs `fold_pricing_identity`) covers the case where
+    // a single cumulative snapshot has no provable identity within the agent loop.
+    // The ACP tracker has a DISTINCT multi-notification path: buzz-agent sends
+    // multiple `usage_update` notifications per turn (one per round), and the ACP
+    // tracker must fold identity across those notifications — not last-update-wins.
+    //
+    // Three acceptance tests per the dispatch contract (Paul event 4ad5390e):
+
+    fn pi_payload(input: u64, output: u64, authority: &str, model: &str) -> UsageUpdatePayload {
+        make_pricing_identity_payload(input, output, authority, model)
+    }
+
+    fn no_identity_payload(input: u64, output: u64) -> UsageUpdatePayload {
+        payload(input, output, None)
+    }
+
+    /// ACP identity fold — case A→B: two notifications with different proven
+    /// identities in one turn must poison; published `AgentTurnMetricPayload`
+    /// (i.e. `TurnUsage.pricing_identity`) must be absent.
+    #[test]
+    fn acp_identity_fold_different_identities_poisons() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-acp-ab");
+        tracker.begin_turn("sess-acp-ab");
+
+        // Notification 1: identity A (anthropic / claude-opus).
+        tracker.record(
+            "sess-acp-ab",
+            &pi_payload(1000, 200, "api.anthropic.com", "claude-opus-4-5"),
+        );
+        // Notification 2: identity B (openai / gpt-4o).
+        tracker.record(
+            "sess-acp-ab",
+            &pi_payload(2000, 400, "api.openai.com", "gpt-4o"),
+        );
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            usage.pricing_identity.is_none(),
+            "A→B in one turn: pricing_identity must be absent (poisoned by mismatch)"
+        );
+    }
+
+    /// ACP identity fold — case A→absent: proven identity followed by a
+    /// notification with no identity must poison; published identity must be absent.
+    #[test]
+    fn acp_identity_fold_absent_notification_poisons() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-acp-aabs");
+        tracker.begin_turn("sess-acp-aabs");
+
+        // Notification 1: identity A.
+        tracker.record(
+            "sess-acp-aabs",
+            &pi_payload(1000, 200, "api.anthropic.com", "claude-3-5-haiku"),
+        );
+        // Notification 2: no identity (e.g. unpairable cumulative snapshot).
+        tracker.record("sess-acp-aabs", &no_identity_payload(2000, 400));
+
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            usage.pricing_identity.is_none(),
+            "A→absent in one turn: pricing_identity must be absent (poisoned by missing identity)"
+        );
+    }
+
+    /// ACP identity fold — case A→absent→A: proven identity, then an absent
+    /// notification, then the original identity again — must NOT heal;
+    /// published identity must still be absent.
+    #[test]
+    fn acp_identity_fold_never_heals_after_poison() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-acp-heal");
+        tracker.begin_turn("sess-acp-heal");
+
+        // Notification 1: identity A.
+        tracker.record(
+            "sess-acp-heal",
+            &pi_payload(1000, 200, "api.openai.com", "gpt-4o"),
+        );
+        // Notification 2: absent identity — poisons.
+        tracker.record("sess-acp-heal", &no_identity_payload(2000, 400));
+        // Notification 3: identity A again — must NOT resurrect it.
+        tracker.record(
+            "sess-acp-heal",
+            &pi_payload(3000, 600, "api.openai.com", "gpt-4o"),
+        );
+
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            usage.pricing_identity.is_none(),
+            "A→absent→A in one turn: pricing_identity must remain absent (no healing after poison)"
         );
     }
 }

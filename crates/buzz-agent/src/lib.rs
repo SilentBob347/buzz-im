@@ -101,10 +101,19 @@ struct Session {
     /// Session-cumulative output tokens across all turns.
     accumulated_output_tokens: u64,
     /// Session-cumulative cache-served input tokens across all turns — a subset
-    /// of `accumulated_input_tokens`, not an addition to it. Emitted alongside
-    /// it so a consumer can price the cached slice at the provider's discounted
-    /// rate instead of assuming every input token cost full price.
-    accumulated_cached_input_tokens: u64,
+    /// of `accumulated_input_tokens`, not an addition to it. Tri-state:
+    ///
+    /// - `Unseen`: no turn has ever reported this category.
+    /// - `Exact(n)`: every usage-bearing response in every turn reported this
+    ///   category; `n` is the cumulative sum.
+    /// - `Unknown`: at least one usage-bearing response ever omitted the
+    ///   category — permanently poisoned for this session.
+    accumulated_cached_input_tokens: crate::types::CacheTotalState,
+    /// Session-cumulative cache-written input tokens across all turns — also a
+    /// subset of `accumulated_input_tokens`, not an addition to it.
+    /// Same `Unseen`/`Exact`/`Unknown` tri-state contract as
+    /// `accumulated_cached_input_tokens`.
+    accumulated_cache_write_tokens: crate::types::CacheTotalState,
     /// Session-cumulative total-token state across all turns.
     ///
     /// Mirrors the per-turn `TurnTotalState` tri-state: starts `Unseen`,
@@ -479,7 +488,8 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             effective_model: None,
             accumulated_input_tokens: 0,
             accumulated_output_tokens: 0,
-            accumulated_cached_input_tokens: 0,
+            accumulated_cached_input_tokens: crate::types::CacheTotalState::Unseen,
+            accumulated_cache_write_tokens: crate::types::CacheTotalState::Unseen,
             accumulated_total_state: crate::types::TurnTotalState::Unseen,
         },
     );
@@ -698,8 +708,18 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
         .unwrap_or(&app.cfg.model);
     let mut turn_input_tokens: Option<u64> = None;
     let mut turn_output_tokens: Option<u64> = None;
-    let mut turn_cached_input_tokens: Option<u64> = None;
+    let mut turn_cached_input_tokens: crate::types::CacheTotalState =
+        crate::types::CacheTotalState::Unseen;
+    let mut turn_cache_write_tokens: crate::types::CacheTotalState =
+        crate::types::CacheTotalState::Unseen;
     let mut turn_total_state = crate::types::TurnTotalState::Unseen;
+    // Per-turn billing identity accumulator — three-state:
+    //   None          = no usage-bearing response seen yet (initial)
+    //   Some(Some(pi))= all usage-bearing responses carry the same proven identity
+    //   Some(None)    = poisoned (mixed identities, unproven response, etc.)
+    // Not stored in Session (not session-cumulative); used only for the final
+    // end-of-turn wire emission.
+    let mut turn_pricing_identity: Option<Option<crate::types::PricingIdentity>> = None;
     let mut ctx = RunCtx {
         cfg: &app.cfg,
         effective_model: effective_model_str,
@@ -719,7 +739,9 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
         turn_input_tokens: &mut turn_input_tokens,
         turn_output_tokens: &mut turn_output_tokens,
         turn_cached_input_tokens: &mut turn_cached_input_tokens,
+        turn_cache_write_tokens: &mut turn_cache_write_tokens,
         turn_total_state: &mut turn_total_state,
+        turn_pricing_identity: &mut turn_pricing_identity,
         usage_baseline,
     };
     let result = ctx.run(p.prompt).await;
@@ -753,9 +775,16 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
                 s.accumulated_output_tokens = s
                     .accumulated_output_tokens
                     .saturating_add(turn_output_tokens.unwrap_or(0));
+                // D1 tri-state merge: merge_session propagates Unknown when
+                // the turn was poisoned (any usage-bearing round omitted the
+                // category), and is a no-op when the turn was Unseen (no
+                // usage-bearing response at all).
                 s.accumulated_cached_input_tokens = s
                     .accumulated_cached_input_tokens
-                    .saturating_add(turn_cached_input_tokens.unwrap_or(0));
+                    .merge_session(turn_cached_input_tokens);
+                s.accumulated_cache_write_tokens = s
+                    .accumulated_cache_write_tokens
+                    .merge_session(turn_cache_write_tokens);
                 // Fold the per-turn total state into the session cumulative.
                 // Unknown poisons the session permanently; Exact adds to running sum;
                 // Unseen (turn emitted no usage) leaves the cumulative unchanged.
@@ -767,6 +796,7 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
                     s.accumulated_input_tokens,
                     s.accumulated_output_tokens,
                     s.accumulated_cached_input_tokens,
+                    s.accumulated_cache_write_tokens,
                     s.accumulated_total_state,
                 ))
             } else {
@@ -775,8 +805,13 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
                 None
             }
         };
-        if let Some((accumulated_in, accumulated_out, accumulated_cached, accumulated_total)) =
-            accumulated
+        if let Some((
+            accumulated_in,
+            accumulated_out,
+            accumulated_cached,
+            accumulated_written,
+            accumulated_total,
+        )) = accumulated
         {
             // Same builder the run loop uses for its per-round reports, so the
             // final notification is shape-identical to the ones that preceded
@@ -784,9 +819,14 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
             let update = wire::usage_update_payload(
                 accumulated_in,
                 accumulated_out,
-                accumulated_cached,
+                accumulated_cached.exact_value(),
+                accumulated_written.exact_value(),
                 accumulated_total,
                 effective_model_str,
+                // Pass the proven per-turn identity if consistent; absent otherwise.
+                turn_pricing_identity
+                    .as_ref()
+                    .and_then(|inner| inner.as_ref()),
             );
             wire::send(&wire_tx, goose_session_update(&sid, update)).await;
         }
@@ -867,6 +907,7 @@ async fn acquire_session(
             input_tokens: s.accumulated_input_tokens,
             output_tokens: s.accumulated_output_tokens,
             cached_input_tokens: s.accumulated_cached_input_tokens,
+            cache_write_tokens: s.accumulated_cache_write_tokens,
             total_state: s.accumulated_total_state,
         },
     ))

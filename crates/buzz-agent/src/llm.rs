@@ -216,6 +216,17 @@ impl Llm {
                 .await
             }
         };
+        // Stamp the actually-requested model into the response so the usage
+        // accumulation path can derive pricingIdentity. For OpenAi/Databricks
+        // this is done per-response inside openai_request_for_model (where the
+        // resolved request_model is known after mesh/auto resolution). For the
+        // remaining providers the effective_model IS the request model.
+        let result = result.map(|mut r| {
+            if r.request_model.is_none() {
+                r.request_model = Some(effective_model.to_string());
+            }
+            r
+        });
         // Stamp the effective model into Llm errors so log lines carry
         // `llm: (model-name) 404 Not Found: …` instead of the bare status.
         // The `llm: ` prefix comes from `Display for AgentError::Llm`; the
@@ -575,6 +586,10 @@ impl Llm {
                 self.post_openai(cfg, "/responses", &body, request_model)
                     .await?,
             )
+            .map(|mut r| {
+                r.request_model = Some(request_model.to_string());
+                r
+            })
             .map_err(PostError::from);
         }
         let (body, parse) = build(false, request_model);
@@ -582,7 +597,12 @@ impl Llm {
             .post_openai(cfg, "/chat/completions", &body, request_model)
             .await
         {
-            Ok(value) => parse(value).map_err(PostError::from),
+            Ok(value) => parse(value)
+                .map(|mut r| {
+                    r.request_model = Some(request_model.to_string());
+                    r
+                })
+                .map_err(PostError::from),
             Err(PostError::Agent(error))
                 if cfg.openai_api == OpenAiApi::Auto && self.try_upgrade(&error) =>
             {
@@ -591,6 +611,10 @@ impl Llm {
                     self.post_openai(cfg, "/responses", &body, request_model)
                         .await?,
                 )
+                .map(|mut r| {
+                    r.request_model = Some(request_model.to_string());
+                    r
+                })
                 .map_err(PostError::from)
             }
             Err(error) => Err(error),
@@ -1283,6 +1307,8 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
         &["cache_read_input_tokens"],
         &[("input_tokens_details", "cached_tokens")],
     );
+    // Responses API does not expose cache-write tokens today; stays None.
+    let cache_write_tokens: Option<u64> = None;
     // Responses API reports a genuine provider total. Read it directly —
     // never derived, so it stays None when the provider omits it.
     let total_tokens = sum_usage(&v, &["total_tokens"]);
@@ -1292,10 +1318,13 @@ fn parse_responses(v: Value) -> Result<LlmResponse, AgentError> {
         stop,
         input_tokens,
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         total_tokens,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (openai_request_for_model) after parse.
+        request_model: None,
     })
 }
 
@@ -1520,18 +1549,24 @@ fn parse_anthropic(v: Value) -> Result<LlmResponse, AgentError> {
     // Anthropic reports the cache split flat on `usage`. Note this is already
     // part of `input_tokens` above, which sums it in deliberately.
     let cached_input_tokens = usage_first(&v, &["cache_read_input_tokens"], &[]);
+    // Anthropic reports cache-creation tokens as `cache_creation_input_tokens`;
+    // also a subset of `input_tokens` (already folded in above).
+    let cache_write_tokens = usage_first(&v, &["cache_creation_input_tokens"], &[]);
     Ok(LlmResponse {
         text,
         tool_calls,
         stop,
         input_tokens,
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         // Anthropic reports only category counts; NIP-AM forbids deriving a
         // total from them. Always None for this provider.
         total_tokens: None,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (complete) after parse.
+        request_model: None,
     })
 }
 
@@ -1628,6 +1663,10 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
     let input_tokens = openai_chat_input_tokens(&v);
     let output_tokens = sum_usage(&v, &["completion_tokens"]);
     let cached_input_tokens = openai_chat_cached_tokens(&v);
+    // OpenAI Chat Completions reports cache-write tokens under
+    // `prompt_tokens_details.cache_write_tokens`. A subset of `prompt_tokens`.
+    let cache_write_tokens =
+        usage_first(&v, &[], &[("prompt_tokens_details", "cache_write_tokens")]);
     // OpenAI Chat Completions reports a genuine provider total. Read it
     // directly — never derived, so it stays None when the provider omits it.
     let total_tokens = sum_usage(&v, &["total_tokens"]);
@@ -1637,10 +1676,13 @@ fn parse_openai(v: Value) -> Result<LlmResponse, AgentError> {
         stop,
         input_tokens,
         cached_input_tokens,
+        cache_write_tokens,
         output_tokens,
         total_tokens,
         reasoning,
         reasoning_details: None,
+        // Stamped by the dispatch layer (openai_request_for_model) after parse.
+        request_model: None,
     })
 }
 
