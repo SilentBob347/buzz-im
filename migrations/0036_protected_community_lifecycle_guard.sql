@@ -3,6 +3,16 @@
 -- so a stale database restore cannot resurrect a protected community. Off and
 -- observational communities retain their existing lifecycle behavior.
 
+-- The protected-domain marker must exist before this migration installs the
+-- lifecycle guard. Later invalidation migrations extend this durable marker;
+-- they must not be prerequisites for the guard that protects it.
+CREATE TABLE authorization_invalidation_domains (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    generation   BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (community_id)
+);
+
 CREATE FUNCTION deny_unwitnessed_protected_community_lifecycle() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN

@@ -365,12 +365,14 @@ pub trait ProtectedAuthorizationResolver: Send + Sync {
 }
 
 /// Display-only result retained with its exact invalidation observer.
+#[allow(dead_code)]
 pub struct ProtectedStatusResolution {
     disposition: VerificationOnlyDisposition,
     observer: Arc<dyn LeaseCurrentStateObserver>,
     evaluation_generation: u64,
 }
 
+#[allow(dead_code)]
 impl ProtectedStatusResolution {
     /// Couple one current status to the invalidation fence captured for it.
     pub fn new(

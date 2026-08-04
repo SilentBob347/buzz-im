@@ -1,15 +1,9 @@
--- Durable, provider-neutral authorization invalidation authority.
+-- Extend the durable, provider-neutral protected-domain marker with
+-- authorization invalidation authority.
 --
 -- Generations are allocated under a per-community row lock. Receipts make
 -- retries idempotent, while selector floors retain the strongest committed
 -- fail-closed effect. Redis fan-out is only a hint to read these tables.
-
-CREATE TABLE authorization_invalidation_domains (
-    community_id UUID NOT NULL REFERENCES communities(id),
-    generation   BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (community_id)
-);
 
 CREATE TABLE authorization_invalidation_receipts (
     community_id        UUID NOT NULL REFERENCES communities(id),

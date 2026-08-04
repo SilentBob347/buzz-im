@@ -135,6 +135,7 @@ impl AuthorizationProfileId {
         Ok(Self(value))
     }
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new(value: impl Into<String>) -> Result<Self, ProviderContractError> {
         Self::from_server_configuration(value)
     }
