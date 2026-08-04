@@ -1271,6 +1271,7 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
     }
 
     /// Require current database authority for protected peer confirmation.
+    #[allow(dead_code)]
     pub(crate) fn with_authority_verifier(
         mut self,
         verifier: crate::authorization_runtime::ephemeral::AuthorityTokenVerifier,

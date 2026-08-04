@@ -311,12 +311,14 @@ pub trait ProtectedAuthorizationResolver: Send + Sync {
 }
 
 /// Display-only result retained with its exact invalidation observer.
+#[allow(dead_code)]
 pub struct ProtectedStatusResolution {
     disposition: VerificationOnlyDisposition,
     observer: Arc<dyn LeaseCurrentStateObserver>,
     evaluation_generation: u64,
 }
 
+#[allow(dead_code)]
 impl ProtectedStatusResolution {
     /// Couple one current status to the invalidation fence captured for it.
     pub fn new(
@@ -818,10 +820,12 @@ pub struct ProtectedEnrollmentAuthority {
 }
 
 impl ProtectedEnrollmentAuthority {
+    #[allow(dead_code)]
     pub(super) const fn disposition(&self) -> &EnrollmentDisposition {
         &self.disposition
     }
 
+    #[allow(dead_code)]
     pub(super) fn observer(&self) -> &dyn LeaseCurrentStateObserver {
         self.observer.as_ref()
     }
@@ -919,6 +923,7 @@ impl ProtectedAuthorization {
     /// Seal opaque sender authority for one ephemeral event delivered across
     /// the trusted relay Redis plane. The resulting claim still requires a
     /// relay signature and writer-database revalidation on the receiving pod.
+    #[allow(dead_code)]
     pub(crate) fn seal_ephemeral_delivery(
         &self,
         event_id: [u8; 32],
@@ -981,10 +986,12 @@ pub struct ProtectedOperationAuthority {
 }
 
 impl ProtectedOperationAuthority {
+    #[allow(dead_code)]
     pub(super) fn context(&self) -> &AuthContext {
         &self.context
     }
 
+    #[allow(dead_code)]
     pub(super) fn observer(&self) -> &dyn LeaseCurrentStateObserver {
         self.observer.as_ref()
     }

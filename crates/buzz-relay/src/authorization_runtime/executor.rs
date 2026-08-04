@@ -31,11 +31,13 @@ impl fmt::Debug for AuthorizationCommitFence {
 }
 
 /// Opaque ephemeral claim that cannot be constructed in this review unit.
+#[allow(dead_code)]
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) struct EphemeralAuthorityClaim {
     _private: (),
 }
 
+#[allow(dead_code)]
 impl EphemeralAuthorityClaim {
     pub(super) fn from_authority(
         _authority: &ProtectedOperationAuthority,
