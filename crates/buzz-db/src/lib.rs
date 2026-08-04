@@ -2455,6 +2455,16 @@ impl Db {
         channel::get_member_role(&self.pool, community_id, channel_id, pubkey).await
     }
 
+    /// Revalidate uncached read access to one channel in one query.
+    pub async fn channel_read_authorized(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<bool> {
+        channel::channel_read_authorized(&self.pool, community_id, channel_id, pubkey).await
+    }
+
     /// Revalidate uncached read access to a complete channel set in one query.
     pub async fn channel_set_read_authorized(
         &self,
@@ -2463,6 +2473,15 @@ impl Db {
         pubkey: &[u8],
     ) -> Result<bool> {
         channel::channel_set_read_authorized(&self.pool, community_id, channel_ids, pubkey).await
+    }
+
+    /// Fail closed before the invalidation slice owns durable operation receipts.
+    pub async fn authorization_operation_receipt_fingerprint(
+        &self,
+        _community_id: CommunityId,
+        _operation_id: Uuid,
+    ) -> Result<Option<[u8; 32]>> {
+        Ok(None)
     }
 
     /// Archive ephemeral channels whose TTL deadline has passed.

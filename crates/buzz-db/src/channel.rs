@@ -1607,6 +1607,38 @@ pub async fn get_member_role_tx(
     Ok(row.map(|r| r.try_get("role")).transpose()?)
 }
 
+/// Revalidate uncached access to one stored channel at a release boundary.
+pub async fn channel_read_authorized(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    actor: &[u8],
+) -> Result<bool> {
+    let allowed = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT c.visibility::text <> 'private'
+            OR EXISTS (
+                SELECT 1
+                FROM channel_members cm
+                WHERE cm.community_id = c.community_id
+                  AND cm.channel_id = c.id
+                  AND cm.pubkey = $3
+                  AND cm.removed_at IS NULL
+            )
+        FROM channels c
+        WHERE c.community_id = $1
+          AND c.id = $2
+          AND c.deleted_at IS NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(actor)
+    .fetch_optional(pool)
+    .await?;
+    Ok(allowed.unwrap_or(false))
+}
+
 /// Revalidate uncached read access to an entire channel set in one database
 /// statement.
 pub async fn channel_set_read_authorized(

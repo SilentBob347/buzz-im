@@ -731,32 +731,6 @@ mod tests {
     use super::*;
     use crate::channel::{ChannelType, ChannelVisibility};
 
-    impl crate::Db {
-        async fn authorization_operation_receipt_fingerprint(
-            &self,
-            community_id: CommunityId,
-            operation_id: Uuid,
-        ) -> crate::Result<Option<[u8; 32]>> {
-            let value: Option<Vec<u8>> = sqlx::query_scalar(
-                "SELECT request_fingerprint FROM authorization_operation_receipts \
-                 WHERE community_id=$1 AND operation_id=$2",
-            )
-            .bind(community_id.as_uuid())
-            .bind(operation_id)
-            .fetch_optional(&self.pool)
-            .await?;
-            value
-                .map(|bytes| {
-                    bytes.try_into().map_err(|_| {
-                        crate::DbError::InvalidData(
-                            "authorization receipt fingerprint must be 32 bytes".to_owned(),
-                        )
-                    })
-                })
-                .transpose()
-        }
-    }
-
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
     async fn setup() -> (crate::Db, CommunityId, Uuid, [u8; 32]) {

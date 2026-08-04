@@ -871,6 +871,15 @@ impl IdentityAssertionInput {
     pub fn jwt(&self) -> &str {
         &self.jwt
     }
+
+    /// Preserve the inherited JWT-only WebSocket lane before the production
+    /// route slice installs deployment-verified provenance.
+    pub(crate) fn legacy_jwt(jwt: String) -> Self {
+        Self {
+            jwt,
+            assertion_transport: None,
+        }
+    }
 }
 
 impl fmt::Debug for IdentityAssertionInput {

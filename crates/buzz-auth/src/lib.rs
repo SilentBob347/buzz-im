@@ -59,6 +59,17 @@ pub use evidence_adapter::{
     ActiveBindingResolution, EvidenceAdapterError, VerifiedDelegationOutput,
     VerifiedEvidenceAdapter,
 };
+
+/// Opaque display-only result used by the protected-transport interface.
+///
+/// The finalization slice replaces this compatibility type with the complete
+/// current-binding disposition. It intentionally has no public constructor so
+/// this earlier review unit cannot mint verification status or authority.
+#[must_use]
+#[derive(PartialEq, Eq)]
+pub struct VerificationOnlyDisposition {
+    _private: (),
+}
 pub use lease::{
     AccessLeasePolicy, ApplicationLeaseLimit, AuthorizationClock, AuthorizationClockError,
     AuthorizationClockSkew, AuthorizationLease, AuthorizationLeaseValidator,
