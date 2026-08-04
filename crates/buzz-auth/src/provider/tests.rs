@@ -467,8 +467,6 @@ fn delegated_proof(actor: &Keys, owner: &Keys, expiry: u64) -> VerifiedNostrProo
     let delegation = VerifiedTransportDelegation::new_unrestricted(
         owner.public_key(),
         actor.public_key(),
-        Uuid::from_u128(0x501),
-        1,
         Some(DelegationExpiry::new(expiry).expect("synthetic delegation expiry is valid")),
     )
     .expect("synthetic delegation is valid");
@@ -2218,8 +2216,6 @@ fn request_construction_rejects_mismatched_verified_evidence() {
     let delegation = VerifiedTransportDelegation::new_unrestricted(
         owner.public_key(),
         actor.public_key(),
-        Uuid::from_u128(0x502),
-        1,
         Some(DelegationExpiry::new(NOW + 20).expect("synthetic expiry is valid")),
     )
     .expect("synthetic delegation is valid");
@@ -2277,8 +2273,6 @@ fn request_construction_rejects_mismatched_verified_evidence() {
     let expired_delegation = VerifiedTransportDelegation::new_unrestricted(
         owner.public_key(),
         actor.public_key(),
-        Uuid::from_u128(0x503),
-        1,
         Some(DelegationExpiry::new(NOW).expect("synthetic expiry is valid")),
     )
     .expect("synthetic delegation is valid");
