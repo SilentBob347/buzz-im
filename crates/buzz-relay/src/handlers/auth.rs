@@ -209,7 +209,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 &state,
                 conn.tenant.community(),
                 pubkey,
-                conn.corporate_identity_jwt.as_deref(),
+                conn.corporate_identity_assertion.as_ref(),
                 auth_tag_json.as_deref(),
             )
             .await

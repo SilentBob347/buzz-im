@@ -926,15 +926,6 @@ pub struct AppState {
             Arc<dyn crate::corporate_identity::IdentityAssertionProvenanceVerifier>,
         >,
     >,
-    /// Complete-stack-gated NIP-FI discovery. The stock binary leaves this
-    /// unset; only an immutable reviewed conformance input can construct it.
-    pub nip_fi_discovery: Arc<std::sync::OnceLock<crate::nip11::ConformanceReadyNipFiDiscovery>>,
-    /// Optional RFC-gated, dedicated client-status presentation runtime.
-    pub client_status_runtime: Arc<
-        std::sync::OnceLock<
-            Arc<crate::authorization_runtime::status::ProductionClientStatusRuntime>,
-        >,
-    >,
     /// Independent version witness installed with protected authorization.
     pub restore_protection: Arc<
         std::sync::OnceLock<Arc<crate::authorization_runtime::restore::RestoreProtectionRuntime>>,
@@ -1117,8 +1108,6 @@ impl AppState {
             mesh: Arc::new(std::sync::OnceLock::new()),
             protected_transport: Arc::new(std::sync::OnceLock::new()),
             identity_assertion_provenance: Arc::new(std::sync::OnceLock::new()),
-            nip_fi_discovery: Arc::new(std::sync::OnceLock::new()),
-            client_status_runtime: Arc::new(std::sync::OnceLock::new()),
             restore_protection: Arc::new(std::sync::OnceLock::new()),
         };
         (
@@ -1164,34 +1153,6 @@ impl AppState {
         &self,
     ) -> Option<&Arc<dyn crate::corporate_identity::IdentityAssertionProvenanceVerifier>> {
         self.identity_assertion_provenance.get()
-    }
-
-    /// Install exact-revision NIP-FI discovery readiness once.
-    pub fn install_nip_fi_discovery(
-        &self,
-        ready: crate::nip11::ConformanceReadyNipFiDiscovery,
-    ) -> Result<(), crate::nip11::ConformanceReadyNipFiDiscovery> {
-        self.nip_fi_discovery.set(ready)
-    }
-
-    /// Return complete-stack-gated NIP-FI discovery, if installed.
-    pub fn nip_fi_discovery(&self) -> Option<&crate::nip11::ConformanceReadyNipFiDiscovery> {
-        self.nip_fi_discovery.get()
-    }
-
-    /// Install an externally approved dedicated client-status runtime once.
-    pub fn install_client_status_runtime(
-        &self,
-        runtime: Arc<crate::authorization_runtime::status::ProductionClientStatusRuntime>,
-    ) -> Result<(), Arc<crate::authorization_runtime::status::ProductionClientStatusRuntime>> {
-        self.client_status_runtime.set(runtime)
-    }
-
-    /// Return the approved client-status runtime, if installed.
-    pub fn client_status_runtime(
-        &self,
-    ) -> Option<&Arc<crate::authorization_runtime::status::ProductionClientStatusRuntime>> {
-        self.client_status_runtime.get()
     }
 
     /// Install the restore-independent version witness exactly once.
