@@ -1587,6 +1587,65 @@ pub async fn get_member_role(
     Ok(row.map(|r| r.try_get("role")).transpose()?)
 }
 
+/// Get the active role on the caller's transaction snapshot.
+pub async fn get_member_role_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT cm.role::text AS role FROM channel_members cm \
+         JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL \
+         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3 AND cm.removed_at IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(pubkey)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(row.map(|r| r.try_get("role")).transpose()?)
+}
+
+/// Revalidate uncached read access to an entire channel set in one database
+/// statement.
+pub async fn channel_set_read_authorized(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_ids: &[Uuid],
+    actor: &[u8],
+) -> Result<bool> {
+    if channel_ids.is_empty() {
+        return Ok(true);
+    }
+    let allowed = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT COUNT(DISTINCT c.id) = cardinality($2::uuid[])
+        FROM channels c
+        WHERE c.community_id = $1
+          AND c.id = ANY($2::uuid[])
+          AND c.deleted_at IS NULL
+          AND (
+              c.visibility::text <> 'private'
+              OR EXISTS (
+                  SELECT 1
+                  FROM channel_members cm
+                  WHERE cm.community_id = c.community_id
+                    AND cm.channel_id = c.id
+                    AND cm.pubkey = $3
+                    AND cm.removed_at IS NULL
+              )
+          )
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_ids)
+    .bind(actor)
+    .fetch_one(pool)
+    .await?;
+    Ok(allowed)
+}
+
 /// Archive ephemeral channels whose TTL deadline has passed.
 ///
 /// Returns the `(community_id, host, channel_id)` list that was archived. Idempotent — the
