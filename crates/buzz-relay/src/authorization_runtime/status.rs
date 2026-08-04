@@ -812,13 +812,17 @@ impl ProductionClientStatusRuntime {
         // becoming connection authority in VerifyOnly. Enforce retains its
         // independent protected-session cancellation fence.
         let presentation_cancellation = CancellationToken::new();
+        let session_target = state
+            .conn_manager
+            .authorization_session_target(connection_id)
+            .ok_or(super::transport::ProtectedTransportError::InvalidSessionId)?;
         let request = super::transport::ProtectedOperationRequest::new_with_cancellation(
             proof,
             Some(assertion),
             buzz_auth::AuthorizationCapability::CommunityRead,
             Uuid::new_v4(),
             "client.status.current",
-            Some(connection_id),
+            Some(session_target),
             Some(presentation_cancellation.clone()),
         )?;
         let Some(resolution) = protected.present_status(&request).await? else {

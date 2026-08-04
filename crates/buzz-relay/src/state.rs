@@ -19,7 +19,7 @@ use buzz_audit::AuditService;
 use buzz_auth::{AuthService, Nip98ReplayGuard, VerifiedFederatedAssertion, VerifiedNostrProof};
 use buzz_core::tenant::TenantContext;
 use buzz_core::CommunityId;
-use buzz_db::Db;
+use buzz_db::{authorization_invalidation::AuthorizationSessionTarget, Db};
 use buzz_media::MediaStorage;
 use buzz_pubsub::cache_invalidation::CacheInvalidation;
 use buzz_pubsub::conn_control::ConnControl;
@@ -42,6 +42,8 @@ type ScopedRateLimiter = DashMap<ScopedPubkeyKey, SlidingWindowCounter>;
 
 /// Per-connection entry in the connection manager.
 struct ConnEntry {
+    /// Exact server-issued identity of this connection issuance.
+    authorization_session_target: AuthorizationSessionTarget,
     tx: mpsc::Sender<OutboundData>,
     /// Control-frame sender, drained ahead of data and before cancel wins in
     /// the send loop. Used to deliver a ban-disconnect frame that must reach
@@ -263,11 +265,18 @@ impl ConnectionManager {
         subscriptions: ConnectionSubscriptions,
         grace_limit: u8,
     ) {
+        let Ok(authorization_session_target) =
+            AuthorizationSessionTarget::new(conn_id, Uuid::new_v4())
+        else {
+            cancel.cancel();
+            return;
+        };
         let drain_ctrl_tx = ctrl_tx.clone();
         let drain_cancel = cancel.clone();
         self.connections.insert(
             conn_id,
             ConnEntry {
+                authorization_session_target,
                 tx,
                 ctrl_tx,
                 cancel,
@@ -482,6 +491,16 @@ impl ConnectionManager {
         self.connections
             .get(&conn_id)
             .and_then(|entry| entry.verified_nostr_proof.read().ok()?.clone())
+    }
+
+    /// Return the exact server-issued target for one live connection issuance.
+    pub fn authorization_session_target(
+        &self,
+        conn_id: Uuid,
+    ) -> Option<AuthorizationSessionTarget> {
+        self.connections
+            .get(&conn_id)
+            .map(|entry| entry.authorization_session_target)
     }
 
     /// Return current direct federated evidence recorded for a connection.

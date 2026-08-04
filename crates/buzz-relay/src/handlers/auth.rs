@@ -213,19 +213,27 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 &state,
                 conn.tenant.community(),
             );
-            let identity_proof = match crate::corporate_identity::verify_corporate_identity(
-                &state,
-                conn.tenant.community(),
-                pubkey,
-                conn.corporate_identity_assertion.as_ref(),
-                auth_tag_json.as_deref(),
-            )
-            .await
-            {
-                Ok(proof) => Some(proof),
-                Err(e) => {
-                    warn!(conn_id = %conn_id, error = ?e, "corporate identity denied");
-                    if identity_lane
+            let neutral_evidence = conn.corporate_identity_assertion.is_none()
+                && crate::authorization_runtime::transport::provider_evidence_resolver_is_installed(
+                    &state,
+                    conn.tenant.community(),
+                );
+            let identity_proof = if neutral_evidence {
+                None
+            } else {
+                match crate::corporate_identity::verify_corporate_identity(
+                    &state,
+                    conn.tenant.community(),
+                    pubkey,
+                    conn.corporate_identity_assertion.as_ref(),
+                    auth_tag_json.as_deref(),
+                )
+                .await
+                {
+                    Ok(proof) => Some(proof),
+                    Err(e) => {
+                        warn!(conn_id = %conn_id, error = ?e, "corporate identity denied");
+                        if identity_lane
                         == crate::authorization_runtime::transport::LegacyIdentityLane::ObserveOnly
                     {
                         None
@@ -237,6 +245,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                             &format!("restricted: {}", e.public_message()),
                         ));
                         return;
+                    }
                     }
                 }
             };
@@ -397,12 +406,19 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
 
             info!(conn_id = %conn_id, "NIP-42 auth successful");
             let transport_delegation =
-                crate::corporate_identity::verify_unconditional_nip_oa_owner(
+                crate::corporate_identity::verify_unconditional_nip_oa_relationship(
                     pubkey,
                     auth_tag_json.as_deref(),
                 )
-                .map(|owner| {
-                    VerifiedDelegationOutput::from_workspace_verifier(owner, pubkey, None, true)
+                .map(|relationship| {
+                    VerifiedDelegationOutput::from_workspace_verifier(
+                        relationship.owner_pubkey(),
+                        pubkey,
+                        relationship.relationship_id(),
+                        relationship.relationship_revision(),
+                        None,
+                        true,
+                    )
                 });
             let verified_proof: Arc<VerifiedNostrProof> = match VerifiedEvidenceAdapter::new()
                 .verify_nip42(
