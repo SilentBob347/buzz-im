@@ -336,15 +336,13 @@ fn capability_coverage_is_exhaustive(capability: AuthorizationCapability) {
 fn proof_method_for_transport(transport: AuthTransport) -> AuthMethod {
     match transport {
         AuthTransport::RelayWebSocket => AuthMethod::Nip42,
-        AuthTransport::HttpBridge | AuthTransport::Git | AuthTransport::MediaDownload => {
-            AuthMethod::Nip98
-        }
-        AuthTransport::MediaUpload => AuthMethod::Blossom,
+        AuthTransport::HttpBridge | AuthTransport::Git => AuthMethod::Nip98,
+        AuthTransport::MediaUpload | AuthTransport::MediaDownload => AuthMethod::Blossom,
         AuthTransport::Audio => AuthMethod::Nip42,
     }
 }
 
-fn all_contract_errors() -> [ProviderContractError; 34] {
+fn all_contract_errors() -> [ProviderContractError; 35] {
     [
         ProviderContractError::EmptyCapabilitySet,
         ProviderContractError::EmptyProfileId,
@@ -380,6 +378,7 @@ fn all_contract_errors() -> [ProviderContractError; 34] {
         ProviderContractError::CapabilityBindingChanged,
         ProviderContractError::FederatedPolicyChanged,
         ProviderContractError::AuthorizationRuntimeMismatch,
+        ProviderContractError::UnsupportedDelegationScope,
     ]
 }
 
@@ -1837,6 +1836,12 @@ async fn delegated_owner_admission_does_not_require_owner_assertion() {
     assert_eq!(snapshot.binding_id(), Some(Uuid::from_u128(10)));
     assert_eq!(snapshot.binding_version(), Some(BindingVersion::INITIAL));
     assert_eq!(snapshot.transport(), AuthTransport::RelayWebSocket);
+    let admission = snapshot
+        .verified_owner_admission(&existing_binding(&owner))
+        .expect("delegated snapshot matches the exact owner binding");
+    assert_eq!(admission.authorization_domain(), domain(1));
+    assert_eq!(admission.principal(), request.principal());
+    assert_eq!(admission.fresh_until().unix_seconds(), 180);
 }
 
 #[tokio::test]

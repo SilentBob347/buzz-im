@@ -755,8 +755,8 @@ pub enum EffectPermitError {
     /// The closed identifier has no registry row.
     #[error("protected effect is not classified")]
     Unclassified,
-    /// The registered effect is deliberately unavailable in Enforce.
-    #[error("protected effect is unavailable in enforce mode")]
+    /// The registered effect is deliberately unavailable in protected mode.
+    #[error("protected effect is unavailable in protected mode")]
     Unavailable(UnavailableReason),
 }
 
@@ -769,7 +769,7 @@ pub fn require_effect_permit(
         .iter()
         .find(|surface| surface.id == id)
         .ok_or(EffectPermitError::Unclassified)?;
-    if mode == Some(AuthorizationMode::Enforce) {
+    if mode.is_some_and(AuthorizationMode::protects_surfaces) {
         if let EnforceDisposition::DenyBeforeEffect(reason) = surface.enforce {
             return Err(EffectPermitError::Unavailable(reason));
         }

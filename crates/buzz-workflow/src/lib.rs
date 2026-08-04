@@ -255,6 +255,13 @@ impl WorkflowEngine {
         result: Result<ExecutionResult, (WorkflowError, PartialProgress)>,
         existing_trace: Option<Vec<serde_json::Value>>,
     ) {
+        if let Err(error) = self.require_mutation(community_id) {
+            tracing::warn!(
+                run_id = %run_id,
+                "Skipping workflow finalization because mutation authority is unavailable: {error}"
+            );
+            return;
+        }
         let prefix = existing_trace.unwrap_or_default();
 
         match result {
@@ -429,6 +436,14 @@ impl WorkflowEngine {
                 tracing::warn!(
                     workflow_id = %workflow.id,
                     "Skipping workflow — owner authority check failed: {e}"
+                );
+                continue;
+            }
+
+            if let Err(error) = self.require_mutation(community_id) {
+                tracing::warn!(
+                    workflow_id = %workflow.id,
+                    "Skipping workflow because mutation authority is unavailable: {error}"
                 );
                 continue;
             }
@@ -642,6 +657,14 @@ impl WorkflowEngine {
                     tracing::warn!(
                         workflow_id = %workflow.id,
                         "Cron tick: skipping workflow — owner authority check failed: {e}"
+                    );
+                    continue;
+                }
+
+                if let Err(error) = self.require_mutation(community_id) {
+                    tracing::warn!(
+                        workflow_id = %workflow.id,
+                        "Cron tick: skipping workflow because mutation authority is unavailable: {error}"
                     );
                     continue;
                 }
