@@ -1568,23 +1568,31 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum OwnerAdmissionError {
+    /// The snapshot does not represent delegated owner authority.
     #[error("capability snapshot does not carry delegated owner authority")]
     NotDelegatedSnapshot,
+    /// The snapshot and owner binding belong to different domains.
     #[error("capability snapshot and owner binding domains do not match")]
     AuthorizationDomainMismatch,
+    /// The snapshot and owner binding identify different owner keys.
     #[error("capability snapshot and owner binding keys do not match")]
     OwnerKeyMismatch,
+    /// The snapshot and owner binding identify different principals.
     #[error("capability snapshot and owner binding principals do not match")]
     PrincipalMismatch,
+    /// The snapshot and owner binding carry different binding identifiers.
     #[error("capability snapshot and owner binding identifiers do not match")]
     BindingIdMismatch,
+    /// The snapshot and owner binding carry different binding generations.
     #[error("capability snapshot and owner binding versions do not match")]
     BindingVersionMismatch,
+    /// The snapshot's admission freshness bound is absent or invalid.
     #[error("capability snapshot has an invalid admission freshness bound")]
     InvalidFreshnessBound,
 }
 
 impl OwnerAdmissionError {
+    /// Stable provider-neutral diagnostic code for the admission failure.
     pub const fn code(self) -> &'static str {
         match self {
             Self::NotDelegatedSnapshot => "authorization_owner_admission_001",

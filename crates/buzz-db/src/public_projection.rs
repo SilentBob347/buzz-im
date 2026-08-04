@@ -1382,13 +1382,64 @@ mod tests {
     };
     use crate::identity_lifecycle::{
         revoke_identity_key, rotate_identity_binding, IdentityPrincipal, LifecycleContext,
-        VerifiedReplacementKey,
+        LifecycleOperationId, VerifiedReplacementKey,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use sqlx::PgPool;
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
     const ISSUER: &str = "https://idp.example";
+    const TEST_ACTOR: [u8; 32] = [0xA4; 32];
+
+    async fn resolve_test_binding(
+        db: &Db,
+        community: CommunityId,
+        issuer: &str,
+        subject: &str,
+        pubkey: &[u8],
+        enrollment_mode: EnrollmentMode,
+        key_attested: bool,
+    ) -> ResolveBindingResult {
+        resolve_identity_binding(
+            &db.pool,
+            &ResolveBindingInput {
+                authorization_domain: community,
+                issuer,
+                subject,
+                pubkey,
+                display_name: None,
+                enrollment_mode,
+                key_attested,
+                policy_version: "test-policy-v1",
+                evidence_valid_from: 0,
+                evidence_valid_until: i64::MAX as u64,
+            },
+        )
+        .await
+        .expect("resolve test binding")
+    }
+
+    fn lifecycle(reason: &str) -> LifecycleContext<'_> {
+        lifecycle_with_id(LifecycleOperationId::issue(), reason)
+    }
+
+    fn lifecycle_with_id(operation_id: LifecycleOperationId, reason: &str) -> LifecycleContext<'_> {
+        LifecycleContext {
+            operation_id,
+            actor: &TEST_ACTOR,
+            reason,
+        }
+    }
+
+    fn replacement(pubkey: &[u8]) -> VerifiedReplacementKey<'_> {
+        VerifiedReplacementKey::after_verified_proof(
+            pubkey,
+            None,
+            BindingProvenance::AttestedKey,
+            "test-policy-v1",
+        )
+        .expect("verified replacement")
+    }
 
     async fn setup() -> (Db, CommunityId) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
@@ -1509,20 +1560,16 @@ mod tests {
         let (db, community) = setup().await;
         let relay = Keys::generate();
         let subject = Keys::generate().public_key();
-        let source = match resolve_identity_binding(
-            &db.pool,
+        let source = match resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "delivery-race-subject",
-                pubkey: subject.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            ISSUER,
+            "delivery-race-subject",
+            subject.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
         .await
-        .expect("enroll binding")
         {
             ResolveBindingResult::Enrolled(evidence) => ProjectionBindingOrigin {
                 binding_id: evidence.binding_id,
@@ -1546,15 +1593,10 @@ mod tests {
         .await
         .expect("commit active projection");
 
-        let operation_id = Uuid::new_v4();
         revoke_identity_key(
             &db.pool,
             community,
-            LifecycleContext {
-                operation_id,
-                actor: None,
-                reason: "delivery race",
-            },
+            lifecycle("delivery race"),
             subject.as_bytes(),
         )
         .await
@@ -1627,20 +1669,16 @@ mod tests {
         let subject_keys = Keys::generate();
         let subject = subject_keys.public_key();
         let subject_bytes = subject.to_bytes();
-        let resolved = resolve_identity_binding(
-            &db.pool,
+        let resolved = resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "subject-one",
-                pubkey: subject_bytes.as_slice(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            ISSUER,
+            "subject-one",
+            subject_bytes.as_slice(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
-        .await
-        .expect("enroll binding");
+        .await;
         let expected_origin = match resolved {
             ResolveBindingResult::Enrolled(evidence) => ProjectionBindingOrigin {
                 binding_id: evidence.binding_id,
@@ -1666,15 +1704,11 @@ mod tests {
         .await
         .expect("commit active projection");
 
-        let operation_id = Uuid::new_v4();
+        let operation_id = LifecycleOperationId::issue();
         revoke_identity_key(
             &db.pool,
             community,
-            LifecycleContext {
-                operation_id,
-                actor: None,
-                reason: "test revocation",
-            },
+            lifecycle_with_id(operation_id, "test revocation"),
             subject.as_bytes(),
         )
         .await
@@ -1722,7 +1756,7 @@ mod tests {
                AND claim_token=$4",
         )
         .bind(community.as_uuid())
-        .bind(operation_id)
+        .bind(operation_id.as_uuid())
         .bind(relay.public_key().as_bytes())
         .bind(stale_claim.claim_token)
         .execute(&db.pool)
@@ -1768,7 +1802,7 @@ mod tests {
                AND phase='delivery'",
         )
         .bind(community.as_uuid())
-        .bind(operation_id)
+        .bind(operation_id.as_uuid())
         .bind(relay.public_key().as_bytes())
         .execute(&db.pool)
         .await
@@ -1823,20 +1857,16 @@ mod tests {
         let new_keys = Keys::generate();
         let old_key = old_keys.public_key();
         let new_key = new_keys.public_key();
-        let old_origin = match resolve_identity_binding(
-            &db.pool,
+        let old_origin = match resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "rotated-subject",
-                pubkey: old_key.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            ISSUER,
+            "rotated-subject",
+            old_key.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
         .await
-        .expect("enroll rotation source")
         {
             ResolveBindingResult::Enrolled(evidence) => ProjectionBindingOrigin {
                 binding_id: evidence.binding_id,
@@ -1860,27 +1890,16 @@ mod tests {
         .await
         .expect("commit old projection");
 
-        let operation_id = Uuid::new_v4();
         rotate_identity_binding(
             &db.pool,
             community,
-            LifecycleContext {
-                operation_id,
-                actor: None,
-                reason: "test rotation",
-            },
+            lifecycle("test rotation"),
             IdentityPrincipal {
                 issuer: ISSUER,
                 subject: "rotated-subject",
             },
             old_key.as_bytes(),
-            VerifiedReplacementKey::after_verified_proof(
-                new_key.as_bytes(),
-                None,
-                BindingProvenance::AttestedKey,
-                Some("test-policy-v1"),
-            )
-            .expect("verified replacement"),
+            replacement(new_key.as_bytes()),
         )
         .await
         .expect("commit rotation");
@@ -1960,20 +1979,16 @@ mod tests {
         let replacement_keys = Keys::generate();
         let reused_key = reused_keys.public_key();
         let replacement_key = replacement_keys.public_key();
-        let original_origin = match resolve_identity_binding(
-            &db.pool,
+        let original_origin = match resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "original-principal",
-                pubkey: reused_key.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            ISSUER,
+            "original-principal",
+            reused_key.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
         .await
-        .expect("enroll original binding")
         {
             ResolveBindingResult::Enrolled(evidence) => ProjectionBindingOrigin {
                 binding_id: evidence.binding_id,
@@ -1997,44 +2012,29 @@ mod tests {
         .await
         .expect("publish original projection");
 
-        let operation_id = Uuid::new_v4();
         rotate_identity_binding(
             &db.pool,
             community,
-            LifecycleContext {
-                operation_id,
-                actor: None,
-                reason: "free key for unpublished reuse",
-            },
+            lifecycle("free key for unpublished reuse"),
             IdentityPrincipal {
                 issuer: ISSUER,
                 subject: "original-principal",
             },
             reused_key.as_bytes(),
-            VerifiedReplacementKey::after_verified_proof(
-                replacement_key.as_bytes(),
-                None,
-                BindingProvenance::AttestedKey,
-                Some("test-policy-v1"),
-            )
-            .expect("verified replacement"),
+            replacement(replacement_key.as_bytes()),
         )
         .await
         .expect("rotate original binding");
-        let reused_origin = match resolve_identity_binding(
-            &db.pool,
+        let reused_origin = match resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: "https://replacement-idp.example",
-                subject: "replacement-principal",
-                pubkey: reused_key.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            "https://replacement-idp.example",
+            "replacement-principal",
+            reused_key.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
         .await
-        .expect("reuse key before publishing replacement")
         {
             ResolveBindingResult::Enrolled(evidence) => ProjectionBindingOrigin {
                 binding_id: evidence.binding_id,
@@ -2115,20 +2115,16 @@ mod tests {
         let relay = Keys::generate();
         let subject_keys = Keys::generate();
         let subject = subject_keys.public_key();
-        let first_origin = match resolve_identity_binding(
-            &db.pool,
+        let first_origin = match resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "strengthened-principal",
-                pubkey: subject.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::Tofu,
-                key_attested: false,
-            },
+            ISSUER,
+            "strengthened-principal",
+            subject.as_bytes(),
+            EnrollmentMode::Tofu,
+            false,
         )
         .await
-        .expect("enroll tofu binding")
         {
             ResolveBindingResult::Enrolled(evidence) => ProjectionBindingOrigin {
                 binding_id: evidence.binding_id,
@@ -2151,20 +2147,16 @@ mod tests {
         .commit(&original, ProjectionDisposition::Active)
         .await
         .expect("publish version-one projection");
-        let strengthened_origin = match resolve_identity_binding(
-            &db.pool,
+        let strengthened_origin = match resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "strengthened-principal",
-                pubkey: subject.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            ISSUER,
+            "strengthened-principal",
+            subject.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
         .await
-        .expect("strengthen binding without republishing")
         {
             ResolveBindingResult::Existing(evidence) => ProjectionBindingOrigin {
                 binding_id: evidence.binding_id,
@@ -2175,15 +2167,10 @@ mod tests {
         assert_eq!(strengthened_origin.binding_id(), first_origin.binding_id());
         assert!(strengthened_origin.binding_version() > first_origin.binding_version());
 
-        let operation_id = Uuid::new_v4();
         revoke_identity_key(
             &db.pool,
             community,
-            LifecycleContext {
-                operation_id,
-                actor: None,
-                reason: "revoke strengthened binding",
-            },
+            lifecycle("revoke strengthened binding"),
             subject.as_bytes(),
         )
         .await
@@ -2232,20 +2219,16 @@ mod tests {
         let replacement_keys = Keys::generate();
         let reused_key = reused_keys.public_key();
         let replacement_key = replacement_keys.public_key();
-        resolve_identity_binding(
-            &db.pool,
+        resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "first-principal",
-                pubkey: reused_key.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            ISSUER,
+            "first-principal",
+            reused_key.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
-        .await
-        .expect("enroll first principal");
+        .await;
         let first = assertion(&relay, reused_key, true, 300);
         begin_active_public_projection(
             &db,
@@ -2262,44 +2245,29 @@ mod tests {
         .await
         .expect("commit first projection");
 
-        let operation_id = Uuid::new_v4();
         rotate_identity_binding(
             &db.pool,
             community,
-            LifecycleContext {
-                operation_id,
-                actor: None,
-                reason: "free key for reuse test",
-            },
+            lifecycle("free key for reuse test"),
             IdentityPrincipal {
                 issuer: ISSUER,
                 subject: "first-principal",
             },
             reused_key.as_bytes(),
-            VerifiedReplacementKey::after_verified_proof(
-                replacement_key.as_bytes(),
-                None,
-                BindingProvenance::AttestedKey,
-                Some("test-policy-v1"),
-            )
-            .expect("verified replacement"),
+            replacement(replacement_key.as_bytes()),
         )
         .await
         .expect("rotate first principal");
-        resolve_identity_binding(
-            &db.pool,
+        resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: "https://second-idp.example",
-                subject: "second-principal",
-                pubkey: reused_key.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            "https://second-idp.example",
+            "second-principal",
+            reused_key.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
-        .await
-        .expect("reuse key for independent principal");
+        .await;
         let second = assertion(&relay, reused_key, true, 301);
         begin_active_public_projection(
             &db,
@@ -2369,20 +2337,16 @@ mod tests {
         let relay = Keys::generate();
         let subject_keys = Keys::generate();
         let subject = subject_keys.public_key();
-        resolve_identity_binding(
-            &db.pool,
+        resolve_test_binding(
+            &db,
             community,
-            &ResolveBindingInput {
-                issuer: ISSUER,
-                subject: "legacy-projection-subject",
-                pubkey: subject.as_bytes(),
-                display_name: None,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                key_attested: true,
-            },
+            ISSUER,
+            "legacy-projection-subject",
+            subject.as_bytes(),
+            EnrollmentMode::AttestedKey,
+            true,
         )
-        .await
-        .expect("enroll legacy projection subject");
+        .await;
         let active = assertion(&relay, subject, true, 400);
         begin_active_public_projection(
             &db,
@@ -2409,15 +2373,11 @@ mod tests {
         .await
         .expect("simulate pre-migration projection");
 
-        let operation_id = Uuid::new_v4();
+        let operation_id = LifecycleOperationId::issue();
         revoke_identity_key(
             &db.pool,
             community,
-            LifecycleContext {
-                operation_id,
-                actor: None,
-                reason: "retire populated upgrade projection",
-            },
+            lifecycle_with_id(operation_id, "retire populated upgrade projection"),
             subject.as_bytes(),
         )
         .await
@@ -2469,7 +2429,7 @@ mod tests {
              WHERE community_id=$1 AND operation_id=$2 AND relay_pubkey=$3",
         )
         .bind(community.as_uuid())
-        .bind(operation_id)
+        .bind(operation_id.as_uuid())
         .bind(relay.public_key().as_bytes())
         .execute(&db.pool)
         .await

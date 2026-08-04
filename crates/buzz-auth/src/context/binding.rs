@@ -600,6 +600,7 @@ impl VersionedBindingRef {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_evidence_adapter(
         authorization_domain: CommunityId,
         binding_id: Uuid,

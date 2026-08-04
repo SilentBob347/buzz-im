@@ -229,10 +229,9 @@ impl AuthContextInput {
 
     #[allow(dead_code)]
     pub(crate) fn verified_owner_pubkey(&self) -> Option<PublicKey> {
-        match self.nostr_proof.verified_delegation() {
-            Some(delegation) => Some(delegation.owner_pubkey()),
-            None => None,
-        }
+        self.nostr_proof
+            .verified_delegation()
+            .map(VerifiedTransportDelegation::owner_pubkey)
     }
 
     /// Server-resolved tenant carried by the finalization input.
@@ -349,6 +348,7 @@ impl AuthContext {
     ///
     /// `now_unix_seconds` must come from the server clock for the authorization
     /// decision being finalized.
+    #[allow(dead_code)]
     pub(crate) fn finalize_v1(
         input: AuthContextInput,
         federated_policy: ResolvedFederatedPolicy,
@@ -364,6 +364,7 @@ impl AuthContext {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn finalize_v1_with_lease(
         input: AuthContextInput,
         federated_policy: ResolvedFederatedPolicy,
@@ -624,6 +625,7 @@ pub(crate) fn validate_context_evidence(
 }
 
 impl FederatedAuthorization {
+    #[allow(dead_code)]
     pub(crate) const fn active_binding(&self) -> Option<&VersionedBindingRef> {
         match self {
             Self::NotRequired => None,

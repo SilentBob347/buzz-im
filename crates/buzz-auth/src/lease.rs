@@ -315,6 +315,7 @@ pub struct AuthorizationLease {
 
 impl AuthorizationLease {
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn issue(
         lease_version: LeaseVersion,
         authorization_domain: CommunityId,
@@ -812,6 +813,7 @@ impl LeaseValidationError {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn conservative_expiry(
     now: AuthorizationTime,
     provider_effective_until: u64,
