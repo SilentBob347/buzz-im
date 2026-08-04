@@ -1008,9 +1008,12 @@ mod tests {
             );
         }
 
+        assert_eq!(migrations[35].version, 36);
+        let protected_domain_marker = migrations[35].sql.as_str();
+        assert!(protected_domain_marker.contains("CREATE TABLE authorization_invalidation_domains"));
+
         assert_eq!(migrations[40].version, 41);
         let invalidation = migrations[40].sql.as_str();
-        assert!(invalidation.contains("CREATE TABLE authorization_invalidation_domains"));
         assert!(invalidation.contains("CREATE TABLE authorization_invalidation_receipts"));
         assert!(invalidation.contains("CREATE TABLE authorization_invalidation_floors"));
 

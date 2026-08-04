@@ -563,6 +563,13 @@ mod tests {
     struct DenyProvider;
 
     impl AuthorizationProvider for DenyProvider {
+        fn profile_id(&self) -> buzz_auth::AuthorizationProfileId {
+            buzz_auth::AuthorizationProfileId::from_server_configuration(
+                "profile.synthetic-deny.example",
+            )
+            .expect("synthetic profile is valid")
+        }
+
         fn authorize<'a>(
             &'a self,
             _request: &'a AuthorizationRequest,

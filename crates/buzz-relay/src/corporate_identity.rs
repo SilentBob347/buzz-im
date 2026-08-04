@@ -3131,9 +3131,15 @@ mod tests {
         )
         .await
         .expect("commit active projection");
-        db.revoke_identity_key(community, subject.as_bytes(), None, "synthetic revocation")
-            .await
-            .expect("revoke synthetic key");
+        db.revoke_identity_key(
+            community,
+            buzz_db::identity_lifecycle::LifecycleOperationId::issue(),
+            subject.as_bytes(),
+            subject.as_bytes(),
+            "synthetic revocation",
+        )
+        .await
+        .expect("revoke synthetic key");
 
         let observational = make_community(&pool).await;
         let observational_keys = Keys::generate();
@@ -3175,8 +3181,9 @@ mod tests {
         .expect("commit observational projection");
         db.revoke_identity_key(
             observational,
+            buzz_db::identity_lifecycle::LifecycleOperationId::issue(),
             observational_subject.as_bytes(),
-            None,
+            observational_subject.as_bytes(),
             "observational revocation",
         )
         .await
