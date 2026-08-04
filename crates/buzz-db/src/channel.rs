@@ -351,7 +351,7 @@ const CHANNEL_MEMBERSHIP_LOCK_NAMESPACE: &str = "buzz_channel_membership:";
 /// Take the per-channel membership lock. MUST be the first statement in the
 /// transaction that then reads roles/owner counts and writes membership, so the
 /// whole check-then-write sequence is atomic against a concurrent one.
-async fn acquire_channel_membership_lock(
+pub(crate) async fn acquire_channel_membership_lock(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     channel_id: Uuid,
