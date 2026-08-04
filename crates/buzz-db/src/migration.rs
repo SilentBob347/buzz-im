@@ -566,7 +566,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 43);
+        assert_eq!(migrations.len(), 45);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1046,6 +1046,20 @@ mod tests {
         ] {
             assert!(authority_epochs.contains(protected_table));
         }
+
+        assert_eq!(migrations[43].version, 44);
+        let client_status = migrations[43].sql.as_str();
+        assert!(client_status.contains("ADD COLUMN supersedes_revision"));
+        assert!(client_status.contains("client_status_revisions_withdrawal"));
+
+        assert_eq!(migrations[44].version, 45);
+        let projection_retirement = migrations[44].sql.as_str();
+        assert!(projection_retirement.contains("identity_public_projection_heads"));
+        assert!(projection_retirement.contains("identity_public_projection_retirements"));
+        assert!(projection_retirement.contains("source_binding_version"));
+        assert!(!projection_retirement.contains("issuer"));
+        assert!(!projection_retirement.contains("subject TEXT"));
+        assert!(!projection_retirement.contains("display_name"));
     }
 
     fn additive_identity_executable_sql(sql: &str) -> String {

@@ -4,6 +4,9 @@
 
 mod admission;
 
+/// Provider-neutral runtime authorization and bounded finalization.
+pub mod authorization_runtime;
+
 /// REST API route handlers.
 pub mod api;
 /// WebSocket audio relay for huddle voice channels.
@@ -31,6 +34,8 @@ pub mod mesh_boot;
 pub mod metrics;
 /// NIP-11 relay information document.
 pub mod nip11;
+/// Provider-neutral inventory of every protected relay surface.
+pub mod protected_surface;
 /// NIP-01 client/relay message parsing.
 pub mod protocol;
 /// Durable NIP-PL matcher and delivery worker.

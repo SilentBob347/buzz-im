@@ -15,8 +15,16 @@ pub mod admin_moderation;
 pub mod api_token;
 /// Relay-scoped archived identity persistence (NIP-IA).
 pub mod archived_identities;
+/// Transaction-owned admission records for protected audio sessions.
+pub mod audio_admission;
+/// Durable provider-neutral authorization invalidation authority.
+pub mod authorization_invalidation;
+/// Restore-independent high-water snapshots for protected authority.
+pub mod authorization_version;
 /// Channel and membership persistence.
 pub mod channel;
+/// Transaction-owned current-only client verification-status revisions.
+pub mod client_status;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -39,6 +47,12 @@ pub mod moderation;
 pub mod partition;
 /// Buzz product-feedback sidecar persistence.
 pub mod product_feedback;
+/// PostgreSQL-authoritative visibility for protected object-store content.
+pub mod protected_publication;
+/// Monotonic migration and cutover authority for protected object visibility.
+pub mod protected_visibility;
+/// Durable reconciliation for optional relay-authored identity projections.
+pub mod public_projection;
 /// Community-scoped push lease and durable wake-outbox persistence.
 pub mod push;
 /// Reaction persistence.
@@ -69,7 +83,7 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
-fn event_replacement_lock_key(
+pub(crate) fn event_replacement_lock_key(
     community_id: CommunityId,
     kind: i32,
     pubkey: &[u8],
@@ -169,6 +183,43 @@ pub async fn insert_mentions(
     qb.push(" ON CONFLICT DO NOTHING");
 
     qb.build().execute(pool).await?;
+    Ok(())
+}
+
+/// Transaction-aware mention-index projection for a protected event commit.
+pub async fn insert_mentions_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    community_id: CommunityId,
+    event: &nostr::Event,
+    channel_id: Option<Uuid>,
+) -> Result<()> {
+    let created_at_secs = event.created_at.as_secs() as i64;
+    let created_at = DateTime::from_timestamp(created_at_secs, 0)
+        .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
+    for pubkey in event.tags.iter().filter_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.len() >= 2
+            && parts[0] == "p"
+            && parts[1].len() == 64
+            && parts[1]
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+        .then(|| parts[1].to_ascii_lowercase())
+    }) {
+        sqlx::query(
+            "INSERT INTO event_mentions \
+             (community_id, pubkey_hex, event_id, event_created_at, channel_id, event_kind) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(pubkey)
+        .bind(event.id.as_bytes().as_slice())
+        .bind(created_at)
+        .bind(channel_id)
+        .bind(event.kind.as_u16() as i32)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -1933,6 +1984,17 @@ impl Db {
         push::claim_due_match_batch(&self.pool, limit, lease_until).await
     }
 
+    /// Claim a matcher batch outside exact protected Enforce domains.
+    pub async fn claim_due_push_match_batch_excluding(
+        &self,
+        limit: i64,
+        lease_until: DateTime<Utc>,
+        excluded_communities: &[Uuid],
+    ) -> Result<Option<push::ClaimedMatchBatch>> {
+        push::claim_due_match_batch_excluding(&self.pool, limit, lease_until, excluded_communities)
+            .await
+    }
+
     /// Load active endpoint-enabled leases eligible for push matching.
     pub async fn active_push_match_leases(
         &self,
@@ -1965,6 +2027,14 @@ impl Db {
     /// Delete exhausted matcher jobs (periodic sweep, off the claim path).
     pub async fn reap_exhausted_push_matches(&self) -> Result<u64> {
         push::reap_exhausted_matches(&self.pool).await
+    }
+
+    /// Reap matcher jobs outside exact protected Enforce domains.
+    pub async fn reap_exhausted_push_matches_excluding(
+        &self,
+        excluded_communities: &[Uuid],
+    ) -> Result<u64> {
+        push::reap_exhausted_matches_excluding(&self.pool, excluded_communities).await
     }
 
     /// Idempotently enqueue a wake for a matched lease and event.
@@ -2320,6 +2390,27 @@ impl Db {
         channel::get_accessible_channel_ids(&self.pool, community_id, pubkey).await
     }
 
+    /// Revalidate uncached read access to one channel at an outbound release
+    /// boundary.
+    pub async fn channel_read_authorized(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        pubkey: &[u8],
+    ) -> Result<bool> {
+        channel::channel_read_authorized(&self.pool, community_id, channel_id, pubkey).await
+    }
+
+    /// Revalidate uncached read access to a complete channel set in one query.
+    pub async fn channel_set_read_authorized(
+        &self,
+        community_id: CommunityId,
+        channel_ids: &[Uuid],
+        pubkey: &[u8],
+    ) -> Result<bool> {
+        channel::channel_set_read_authorized(&self.pool, community_id, channel_ids, pubkey).await
+    }
+
     /// Lists channels, optionally filtered by visibility.
     pub async fn list_channels(
         &self,
@@ -2454,6 +2545,14 @@ impl Db {
         channel::reap_expired_ephemeral_channels(&self.pool).await
     }
 
+    /// Archive expired ephemeral channels outside protected Enforce domains.
+    pub async fn reap_expired_ephemeral_channels_excluding(
+        &self,
+        excluded_communities: &[Uuid],
+    ) -> Result<Vec<channel::ReapedEphemeralChannel>> {
+        channel::reap_expired_ephemeral_channels_excluding(&self.pool, excluded_communities).await
+    }
+
     /// Query due reminders ready for delivery.
     pub async fn query_due_reminders(
         &self,
@@ -2461,6 +2560,22 @@ impl Db {
         batch_limit: i64,
     ) -> Result<Vec<event::DueReminder>> {
         event::query_due_reminders(&self.pool, now_secs, batch_limit).await
+    }
+
+    /// Query reminders outside protected Enforce domains.
+    pub async fn query_due_reminders_excluding(
+        &self,
+        now_secs: i64,
+        batch_limit: i64,
+        excluded_communities: &[Uuid],
+    ) -> Result<Vec<event::DueReminder>> {
+        event::query_due_reminders_excluding(
+            &self.pool,
+            now_secs,
+            batch_limit,
+            excluded_communities,
+        )
+        .await
     }
 
     /// Atomically claim a due reminder for delivery (cross-pod dedup).
@@ -4333,6 +4448,16 @@ impl Db {
         relay_invite::reap_expired_relay_invites(&self.pool, cutoff).await
     }
 
+    /// Delete expired invites outside protected Enforce domains.
+    pub async fn reap_expired_relay_invites_excluding(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        excluded_communities: &[Uuid],
+    ) -> Result<u64> {
+        relay_invite::reap_expired_relay_invites_excluding(&self.pool, cutoff, excluded_communities)
+            .await
+    }
+
     /// Atomically claims a v2 relay invite. The full redemption (membership
     /// insert, policy evidence, use_count increment) runs in one PostgreSQL
     /// transaction with `FOR UPDATE` on the invite row.
@@ -4568,6 +4693,16 @@ impl Db {
         owner_pubkey: &str,
     ) -> Result<i64> {
         git_repo::count_repos_for_owner(&self.pool, community, owner_pubkey).await
+    }
+
+    /// Return an existing Git reservation's immutable publication origin.
+    pub async fn repo_publication_origin(
+        &self,
+        community_id: CommunityId,
+        repo_id: &str,
+        owner_pubkey: &str,
+    ) -> Result<Option<String>> {
+        git_repo::repo_publication_origin(&self.pool, community_id, repo_id, owner_pubkey).await
     }
 
     /// Release a git repo name reservation held by `owner_pubkey` (rollback).
@@ -6279,6 +6414,61 @@ mod tests {
             .expect("idempotent retry")
             .expect("owned community");
         assert_eq!(retry, restored);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn protected_community_lifecycle_is_fail_closed_while_off_remains_legacy() {
+        let db = setup_db().await;
+        let owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let protected_host = format!("protected-lifecycle-{}.example", Uuid::new_v4().simple());
+        let created = db
+            .create_community_with_owner(&protected_host, &owner)
+            .await
+            .expect("create protected fixture");
+        let CreateCommunityWithOwnerResult::Created(protected) = created else {
+            panic!("expected new protected fixture");
+        };
+        sqlx::query("INSERT INTO authorization_invalidation_domains (community_id) VALUES ($1)")
+            .bind(protected.id.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect("activate protected marker");
+
+        assert!(db
+            .archive_community_owned_by(&protected_host, &owner, "reserved.example")
+            .await
+            .is_err());
+        assert!(sqlx::query("DELETE FROM communities WHERE id=$1")
+            .bind(protected.id.as_uuid())
+            .execute(&db.pool)
+            .await
+            .is_err());
+        assert!(db
+            .lookup_community_by_host(&protected_host)
+            .await
+            .expect("protected lookup")
+            .is_some());
+
+        let off_host = format!("off-lifecycle-{}.example", Uuid::new_v4().simple());
+        let created = db
+            .create_community_with_owner(&off_host, &owner)
+            .await
+            .expect("create Off fixture");
+        let CreateCommunityWithOwnerResult::Created(off) = created else {
+            panic!("expected new Off fixture");
+        };
+        assert!(db
+            .archive_community_owned_by(&off_host, &owner, "reserved.example")
+            .await
+            .expect("Off archive keeps legacy behavior")
+            .is_some());
+        assert!(db
+            .unarchive_community_owned_by(&off_host, &owner)
+            .await
+            .expect("Off restore keeps legacy behavior")
+            .is_some());
+        assert!(!off.id.as_uuid().is_nil());
     }
 
     #[tokio::test]

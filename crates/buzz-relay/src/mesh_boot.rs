@@ -157,6 +157,9 @@ pub struct MeshHandle {
     ///
     /// [`MeshAudioRouter`]: crate::audio::mesh::MeshAudioRouter
     pub audio_fence: Arc<crate::audio::mesh::GenerationFloor>,
+    /// Live reliable-control attachments accepted by the realtime media lane.
+    /// Datagrams cannot create entries in this registry.
+    pub audio_attachments: Arc<crate::audio::mesh::MediaAttachmentRegistry>,
     /// The running mesh (status snapshots, shutdown).
     runtime: MeshRuntime,
     /// Per-room huddle owner-lease coordination. Shared with the WS-join owner
@@ -180,6 +183,8 @@ impl MeshHandle {
     pub fn wire_consumers(
         &self,
         rooms: Arc<crate::audio::AudioRoomManager>,
+        db: buzz_db::Db,
+        relay_secret: &[u8],
         demo_echo: bool,
         shutting_down: Arc<AtomicBool>,
     ) {
@@ -189,8 +194,15 @@ impl MeshHandle {
             Arc::clone(&self.transport),
             self.local_runtime_id,
             Arc::clone(&self.audio_fence),
+            Arc::clone(&self.audio_attachments),
             rooms,
             Arc::clone(&self.owners),
+            Some(
+                crate::authorization_runtime::ephemeral::AuthorityTokenVerifier::new(
+                    db,
+                    relay_secret,
+                ),
+            ),
             demo_echo,
             shutting_down,
         )
@@ -221,14 +233,16 @@ impl MeshHandle {
 /// [`HuddleControlAcceptor::accept_inbound`]: crate::audio::join::HuddleControlAcceptor::accept_inbound
 /// [`ReliableJoin::Owned`]: crate::tunnel::reliable::ReliableJoin::Owned
 #[allow(clippy::too_many_arguments)] // boot-only parts bundle, one caller + tests
-pub fn wire_mesh_consumers(
+pub(crate) fn wire_mesh_consumers(
     dispatcher: &MeshInboundDispatcher,
     directory: SessionDirectory,
     transport: Arc<dyn RelayPeerTransport>,
     local_runtime_id: RuntimeId,
     audio_fence: Arc<crate::audio::mesh::GenerationFloor>,
+    audio_attachments: Arc<crate::audio::mesh::MediaAttachmentRegistry>,
     rooms: Arc<crate::audio::AudioRoomManager>,
     owners: Arc<crate::audio::join::HuddleOwnerRegistry>,
+    authority_verifier: Option<crate::authorization_runtime::ephemeral::AuthorityTokenVerifier>,
     demo_echo: bool,
     shutting_down: Arc<AtomicBool>,
 ) {
@@ -239,21 +253,29 @@ pub fn wire_mesh_consumers(
         Arc::clone(&rooms),
         local_runtime_id,
         audio_fence,
+        Arc::clone(&audio_attachments),
     );
-    dispatcher.register_datagrams(Box::new(move |_from, dgram| {
-        audio_router.on_media_datagram(&dgram);
+    dispatcher.register_datagrams(Box::new(move |from, dgram| {
+        audio_router.on_media_datagram(from, &dgram);
     }));
 
     // HuddleControl streams: owner-side peer registration for cross-pod
     // huddles. The acceptor validates structurally, then Redis-fences every
     // stateful frame in its control loop.
-    let acceptor = Arc::new(crate::audio::join::HuddleControlAcceptor::new(
+    let acceptor = crate::audio::join::HuddleControlAcceptor::new(
         rooms,
         Arc::clone(&transport),
         Arc::new(directory.clone()),
         local_runtime_id,
         Arc::clone(&owners),
-    ));
+        audio_attachments,
+    );
+    let acceptor = if let Some(verifier) = authority_verifier {
+        acceptor.with_authority_verifier(verifier)
+    } else {
+        acceptor
+    };
+    let acceptor = Arc::new(acceptor);
     dispatcher.register_huddle_control(Box::new(move |from, hello, stream| {
         let acceptor = Arc::clone(&acceptor);
         tokio::spawn(async move {
@@ -486,6 +508,7 @@ pub async fn boot_mesh(
 
     let runtime = MeshRuntime::start(endpoint, membership, Some(registry));
     let owners = Arc::new(crate::audio::join::HuddleOwnerRegistry::new());
+    let audio_attachments = Arc::new(crate::audio::mesh::MediaAttachmentRegistry::default());
     // Dial seed peers now rather than waiting for the first reconcile tick.
     runtime.reconcile_now().await;
 
@@ -528,6 +551,7 @@ pub async fn boot_mesh(
         local_runtime_id: runtime_id,
         dispatcher,
         audio_fence: Arc::new(crate::audio::mesh::GenerationFloor::new()),
+        audio_attachments,
         runtime,
         owners,
     }))
@@ -719,6 +743,7 @@ mod tests {
 
         let dispatcher = MeshInboundDispatcher::default();
         let fence = Arc::new(crate::audio::mesh::GenerationFloor::new());
+        let attachments = Arc::new(crate::audio::mesh::MediaAttachmentRegistry::default());
         let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1") // never dialed
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
             .unwrap();
@@ -728,25 +753,30 @@ mod tests {
             Arc::new(NoopTransport),
             rid(9),
             Arc::clone(&fence),
+            Arc::clone(&attachments),
             Arc::new(crate::audio::AudioRoomManager::new()),
             Arc::new(crate::audio::join::HuddleOwnerRegistry::new()),
+            None,
             false,
             Arc::new(AtomicBool::new(false)),
         );
 
         let session = uuid::Uuid::new_v4();
+        let fenced = FencedHeader {
+            session_id: session,
+            generation: 7,
+            owner_runtime_id: rid(1),
+        };
+        let _attachment = attachments.register_owner_fanout(fenced, uuid::Uuid::new_v4(), u64::MAX);
         dispatcher.on_datagram(
             rid(1),
             MeshDatagram {
-                fenced: FencedHeader {
-                    session_id: session,
-                    generation: 7,
-                    owner_runtime_id: rid(9),
-                },
+                fenced,
                 seq: 0,
                 payload: vec![0, 1, 2],
             },
         );
+        tokio::task::yield_now().await;
 
         // The shared fence observed the datagram's generation: a stale check
         // through the HANDLE's Arc is rejected, proving one floor, not two.
