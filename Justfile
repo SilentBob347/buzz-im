@@ -263,6 +263,30 @@ desktop-e2e-smoke:
 desktop-e2e-integration: _ensure-migrations
     cd {{desktop_dir}} && pnpm test:e2e:integration
 
+# Start the isolated OSS-only authorization/lifecycle playground.
+oss-e2e-setup:
+    ./scripts/oss-e2e.sh setup
+
+# Run all synthetic OSS-only authorization/lifecycle scenarios.
+oss-e2e:
+    ./scripts/oss-e2e.sh run
+
+# Run one scenario ID, for example: `just oss-e2e-scenario O501`.
+oss-e2e-scenario SCENARIO:
+    ./scripts/oss-e2e.sh scenario {{SCENARIO}}
+
+# Delete only the isolated playground's synthetic volumes and restart it.
+oss-e2e-reset:
+    ./scripts/oss-e2e.sh reset
+
+# Stop the isolated playground while retaining its synthetic volumes.
+oss-e2e-stop:
+    ./scripts/oss-e2e.sh stop
+
+# Show isolated playground service health.
+oss-e2e-status:
+    ./scripts/oss-e2e.sh status
+
 # Run only the e2e specs changed vs origin/main (both projects) before pushing
 desktop-e2e-pre-push: _ensure-migrations
     git fetch origin main
