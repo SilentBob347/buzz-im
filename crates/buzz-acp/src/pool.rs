@@ -1017,7 +1017,7 @@ async fn create_session_and_apply_model(
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness auto-approves via handle_permission_request.
+    // are safely skipped — the harness rejects interactive permission requests.
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
@@ -1130,11 +1130,7 @@ async fn apply_model_switch(
     Ok(())
 }
 
-/// Set the session permission mode via `session/set_config_option`.
-///
-/// Non-fatal for most errors: logs and proceeds. The agent falls back
-/// to its default permission mode (`"default"`), which still works via
-/// Check if the agent's `session/new` response advertises a given mode ID
+/// Check whether the agent's `session/new` response advertises a given mode ID
 /// in `result.modes.availableModes[].id`. Returns `false` if the modes
 /// field is absent or the mode isn't listed.
 fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) -> bool {
@@ -1150,7 +1146,11 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
-/// per-tool auto-approval in `handle_permission_request`.
+/// Set the session permission mode via `session/set_config_option`.
+///
+/// Non-fatal for most errors: logs and proceeds. The agent falls back to its
+/// default mode, and any interactive permission request is rejected by
+/// `handle_permission_request`.
 ///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
 /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
@@ -1190,7 +1190,7 @@ async fn apply_permission_mode(
         Ok(Err(e)) => {
             tracing::warn!(
                 target: "pool::permission",
-                "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
+                "failed to set permission mode {wire:?}: {e} — falling back to per-tool rejection"
             );
         }
         Err(_) => {
@@ -6420,7 +6420,7 @@ mod tests {
             session_id: "claude-session".to_string(),
             turn_seq: 3,
             delta_reliable: true,
-            turn_input_tokens: Some(100),
+            turn_input_tokens: Some(155),
             turn_output_tokens: Some(20),
             turn_total_tokens: None,
             turn_cost_usd: None,
@@ -6442,7 +6442,9 @@ mod tests {
         let cumulative_json =
             serde_json::to_value(cumulative.expect("Claude cumulative cost")).unwrap();
 
-        assert_eq!(turn_json["inputTokens"], serde_json::json!(100));
+        // NIP-AM inputTokens is inclusive: Claude's 100 non-cached input plus
+        // the 30 cache-read and 25 cache-write subsets.
+        assert_eq!(turn_json["inputTokens"], serde_json::json!(155));
         assert_eq!(turn_json["outputTokens"], serde_json::json!(20));
         assert!(turn_json["totalTokens"].is_null());
         assert!(turn_json["costUsd"].is_null());
@@ -6460,7 +6462,7 @@ mod tests {
             session_id: "codex-session".to_string(),
             turn_seq: 3,
             delta_reliable: true,
-            turn_input_tokens: Some(90),
+            turn_input_tokens: Some(130),
             turn_output_tokens: Some(10),
             turn_total_tokens: Some(140),
             turn_cost_usd: None,
@@ -6480,7 +6482,8 @@ mod tests {
         let (turn, cumulative) = crate::pool::build_turn_metric_counts(&usage);
         let turn_json = serde_json::to_value(turn.expect("Codex turn counts")).unwrap();
 
-        assert_eq!(turn_json["inputTokens"], serde_json::json!(90));
+        // NIP-AM.md:167-174 requires cache reads to be folded into inputTokens.
+        assert_eq!(turn_json["inputTokens"], serde_json::json!(130));
         assert_eq!(turn_json["outputTokens"], serde_json::json!(10));
         assert_eq!(turn_json["totalTokens"], serde_json::json!(140));
         assert!(turn_json["costUsd"].is_null());

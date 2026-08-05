@@ -197,9 +197,11 @@ pub struct TurnUsage {
 }
 
 /// Per-turn usage carried by the experimental ACP `session/prompt` response.
-/// Claude and Codex both scope these fields to the completed prompt. Their
-/// input counts exclude cache-served input; preserve that adapter provenance
-/// rather than silently normalizing it.
+/// Claude and Codex both scope these fields to the completed prompt and expose
+/// cache-exclusive `input_tokens` alongside cache reads/writes. Per NIP-AM
+/// "Numeric validity and token semantics" (docs/nips/NIP-AM.md:167-174),
+/// `StandardUsageTracker` folds those components into the NIP-AM-inclusive
+/// input total; the cache fields remain informational subsets.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PromptResponseUsage {
@@ -260,13 +262,20 @@ impl StandardUsageTracker {
             *seq += 1;
             *seq
         };
+        // Both standard adapters expose cache-exclusive input alongside separate
+        // cache components. NIP-AM requires the inclusive input-side total;
+        // cache fields remain informational subsets (NIP-AM.md:167-174).
+        let turn_input_tokens = usage
+            .input_tokens
+            .checked_add(usage.cached_read_tokens.unwrap_or_default())
+            .and_then(|input| input.checked_add(usage.cached_write_tokens.unwrap_or_default()));
         Some(TurnUsage {
             session_id,
             turn_seq,
             // PromptResponse.usage is already per-turn; no cumulative baseline
             // is required for these token counts.
             delta_reliable: true,
-            turn_input_tokens: Some(usage.input_tokens),
+            turn_input_tokens,
             turn_output_tokens: Some(usage.output_tokens),
             // Claude computes this value by adding categories, whereas Codex
             // forwards provider-shaped tokenUsage.last.totalTokens.
