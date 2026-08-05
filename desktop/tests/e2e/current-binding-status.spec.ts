@@ -92,7 +92,6 @@ test("current relay binding is exact-author, generic, clearable, and passively e
     eventAuthorPubkey: TEST_IDENTITIES.bob.pubkey,
     freshUntil,
   });
-
   const badge = matchingRow.getByTestId("current-relay-binding");
   await expect(badge).toHaveCount(1);
   await expect(badge).toHaveAccessibleName("Current relay binding");

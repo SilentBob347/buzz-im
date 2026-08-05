@@ -68,8 +68,16 @@ import {
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
 import { AuthOkTracker } from "@/shared/api/relayAuthPolicy";
 import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
+import {
+  clearCurrentProjection,
+  createCurrentProjectionChannel,
+  type CurrentProjection,
+} from "@/features/binding-status/currentProjectionStore";
 
-export type RelayProjectionSink = (candidate: unknown) => void;
+type NativeSocketBinding = Readonly<{
+  id: number;
+  relayUrl: string;
+}>;
 
 export class RelayClient {
   private wsId: number | null = null;
@@ -93,17 +101,13 @@ export class RelayClient {
   private hasConnectedOnce = false;
   private notifyReconnectListeners = false;
   private onMessageChannel: Channel<unknown> | null = null;
-  private onProjectionChannel: Channel<unknown> | null = null;
+  private onProjectionChannel: Channel<CurrentProjection | null> | null = null;
   private connectionGeneration = 0;
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
   private authOkTracker = new AuthOkTracker();
 
   private terminal = false;
-
-  constructor(
-    private readonly projectionSink: RelayProjectionSink = () => {},
-  ) {}
 
   private connectionStateEmitter = new RelayConnectionStateEmitter("idle");
   private stallWatchdog = new RelayStallWatchdog({
@@ -180,7 +184,7 @@ export class RelayClient {
     this.connectionStateEmitter.clear();
     this.onMessageChannel = null;
     this.onProjectionChannel = null;
-    this.publishProjection(null);
+    clearCurrentProjection();
     this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
   }
 
@@ -544,38 +548,64 @@ export class RelayClient {
     );
 
     const generation = ++this.connectionGeneration;
-    this.publishProjection(null);
+    let nativeWebsocketId: number | null = null;
+    let resolveNativeSocketBinding!: (
+      binding: NativeSocketBinding | null,
+    ) => void;
+    const nativeSocketBinding = new Promise<NativeSocketBinding | null>(
+      (resolve) => {
+        resolveNativeSocketBinding = resolve;
+      },
+    );
+    let nativeSocketBindingSettled = false;
+    const settleNativeSocketBinding = (binding: NativeSocketBinding | null) => {
+      if (nativeSocketBindingSettled) return;
+      nativeSocketBindingSettled = true;
+      resolveNativeSocketBinding(binding);
+    };
     this.onMessageChannel = new Channel<unknown>((message) => {
-      void this.handleWsMessage(message, generation).catch((error) => {
-        if (generation !== this.connectionGeneration) return;
-        this.resetConnection(
-          this.normalizeRelayError(error, "Relay connection errored."),
-        );
-      });
+      void this.handleWsMessage(message, generation, nativeSocketBinding).catch(
+        (error) => {
+          if (generation !== this.connectionGeneration) return;
+          this.resetConnection(
+            this.normalizeRelayError(error, "Relay connection errored."),
+          );
+        },
+      );
     });
-    this.onProjectionChannel = new Channel<unknown>((candidate) => {
-      if (generation !== this.connectionGeneration) return;
-      this.publishProjection(candidate);
-    });
+    let onProjectionChannel: Channel<CurrentProjection | null>;
+    onProjectionChannel = createCurrentProjectionChannel(
+      () =>
+        generation === this.connectionGeneration &&
+        nativeWebsocketId !== null &&
+        this.wsId === nativeWebsocketId &&
+        this.onProjectionChannel === onProjectionChannel,
+    );
+    this.onProjectionChannel = onProjectionChannel;
+    clearCurrentProjection();
 
     try {
       if (!this.relayUrl) {
         this.relayUrl = await getRelayWsUrl();
       }
+      const connectionRelayUrl = this.relayUrl;
       const wsId = await invoke<number>(
         "plugin:websocket|connect_with_status",
         {
-          url: this.relayUrl,
+          url: connectionRelayUrl,
           onMessage: this.onMessageChannel,
-          onProjection: this.onProjectionChannel,
+          onProjection: onProjectionChannel,
           config: {},
         },
       );
       if (generation !== this.connectionGeneration) {
+        settleNativeSocketBinding(null);
         void closeWebSocket(wsId, "stale connection attempt");
         throw new Error("Relay connection attempt was superseded.");
       }
+      nativeWebsocketId = wsId;
       this.wsId = wsId;
+      settleNativeSocketBinding({ id: wsId, relayUrl: connectionRelayUrl });
 
       await new Promise<void>((resolve, reject) => {
         const timeout = window.setTimeout(() => {
@@ -603,6 +633,7 @@ export class RelayClient {
       this.stallWatchdog.start();
       this.emitReconnectIfNeeded();
     } catch (error) {
+      settleNativeSocketBinding(null);
       const connectionError = this.normalizeRelayError(
         error,
         "Failed to connect to relay.",
@@ -771,7 +802,11 @@ export class RelayClient {
     });
   }
 
-  private async handleWsMessage(message: unknown, generation: number) {
+  private async handleWsMessage(
+    message: unknown,
+    generation: number,
+    nativeSocketBinding: Promise<NativeSocketBinding | null>,
+  ) {
     if (generation !== this.connectionGeneration) return;
     this.stallWatchdog.recordInbound();
 
@@ -804,7 +839,9 @@ export class RelayClient {
 
     const [type, ...rest] = data;
     if (type === "AUTH" && typeof rest[0] === "string") {
-      await this.handleAuthChallenge(rest[0], generation);
+      const binding = await nativeSocketBinding;
+      if (!binding || generation !== this.connectionGeneration) return;
+      await this.handleAuthChallenge(rest[0], generation, binding);
       return;
     }
     if (type === "EVENT" && typeof rest[0] === "string" && rest[1]) {
@@ -853,17 +890,22 @@ export class RelayClient {
     }
   }
 
-  private async handleAuthChallenge(challenge: string, generation: number) {
-    if (!this.relayUrl) {
-      this.relayUrl = await getRelayWsUrl();
-    }
-
+  private async handleAuthChallenge(
+    challenge: string,
+    generation: number,
+    nativeSocketBinding: NativeSocketBinding,
+  ) {
     const event = await createAuthEvent({
       challenge,
-      relayUrl: this.relayUrl,
+      nativeWebsocketId: nativeSocketBinding.id,
+      relayUrl: nativeSocketBinding.relayUrl,
     });
 
-    if (generation !== this.connectionGeneration || !this.authRequest) {
+    if (
+      generation !== this.connectionGeneration ||
+      this.wsId !== nativeSocketBinding.id ||
+      !this.authRequest
+    ) {
       return;
     }
 
@@ -1033,7 +1075,7 @@ export class RelayClient {
   ) {
     this.onMessageChannel = null;
     this.onProjectionChannel = null;
-    this.publishProjection(null);
+    clearCurrentProjection();
     this.stallWatchdog.stop();
     this.connectionGeneration++;
     if (this.stabilityTimer !== null) {
@@ -1105,19 +1147,4 @@ export class RelayClient {
     }
   }
 
-  private publishProjection(candidate: unknown) {
-    try {
-      this.projectionSink(candidate);
-    } catch {
-      // Presentation failure must not disturb relay transport. Try to clear
-      // once, without exposing the rejected candidate to logs or errors.
-      if (candidate !== null) {
-        try {
-          this.projectionSink(null);
-        } catch {
-          // The projection is optional presentation; relay operation remains.
-        }
-      }
-    }
-  }
 }

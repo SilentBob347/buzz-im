@@ -1,3 +1,4 @@
+import { Channel } from "@tauri-apps/api/core";
 import * as React from "react";
 
 export type CurrentProjection = Readonly<{
@@ -202,9 +203,17 @@ export function createCurrentProjectionStore(
 
 const currentProjectionStore = createCurrentProjectionStore();
 
-/** Native bridge sink; browser presentation code should use the hook below. */
-export function applyCurrentProjectionFromNative(candidate: unknown): void {
-  currentProjectionStore.replaceFromNative(candidate);
+/**
+ * Create the sole non-null intake for the browser-owned projection store.
+ * The caller's fence binds delivery to one current native status connection.
+ */
+export function createCurrentProjectionChannel(
+  isCurrentConnection: () => boolean,
+): Channel<CurrentProjection | null> {
+  return new Channel<CurrentProjection | null>((candidate) => {
+    if (!isCurrentConnection()) return;
+    currentProjectionStore.replaceFromNative(candidate);
+  });
 }
 
 export function clearCurrentProjection(): void {
