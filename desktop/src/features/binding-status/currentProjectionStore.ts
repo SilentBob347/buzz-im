@@ -13,6 +13,7 @@ type CurrentProjectionStoreOptions = {
   setTimeout?: (callback: () => void, delayMs: number) => TimerHandle;
   clearTimeout?: (handle: TimerHandle) => void;
   maxTimerDelayMs?: number;
+  onListenerError?: () => void;
 };
 
 export type CurrentProjectionStore = {
@@ -24,6 +25,12 @@ export type CurrentProjectionStore = {
 
 const LOWERCASE_HEX_PUBKEY = /^[0-9a-f]{64}$/;
 const DEFAULT_MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function logListenerError(): void {
+  // Do not include the exception or current DTO: either could contain native
+  // payload data outside the browser projection contract.
+  console.error("[currentProjectionStore] subscriber failed");
+}
 
 /**
  * Copy the narrow native DTO into a frozen browser-owned value.
@@ -73,6 +80,7 @@ export function createCurrentProjectionStore(
   const schedule = options.setTimeout ?? globalThis.setTimeout.bind(globalThis);
   const cancel =
     options.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
+  const onListenerError = options.onListenerError ?? logListenerError;
   const configuredMaxDelay = options.maxTimerDelayMs;
   const maxTimerDelayMs =
     typeof configuredMaxDelay === "number" &&
@@ -87,7 +95,17 @@ export function createCurrentProjectionStore(
   const listeners = new Set<() => void>();
 
   const emitChange = () => {
-    for (const listener of [...listeners]) listener();
+    for (const listener of [...listeners]) {
+      try {
+        listener();
+      } catch {
+        try {
+          onListenerError();
+        } catch {
+          // Logging is best-effort and must not break the state transition.
+        }
+      }
+    }
   };
 
   const invalidatePendingWork = (): number => {
@@ -108,13 +126,15 @@ export function createCurrentProjectionStore(
     emitChange();
   };
 
-  const armExpiry = (projection: CurrentProjection, capturedToken: number) => {
-    if (capturedToken !== workToken) return;
+  const armExpiry = (
+    projection: CurrentProjection,
+    capturedToken: number,
+  ): boolean => {
+    if (capturedToken !== workToken) return false;
 
     const now = nowSeconds();
     if (!Number.isFinite(now) || now >= projection.freshUntil) {
-      clear();
-      return;
+      return false;
     }
 
     const remainingSeconds = projection.freshUntil - now;
@@ -124,20 +144,30 @@ export function createCurrentProjectionStore(
         : Math.max(1, Math.ceil(remainingSeconds * 1_000));
 
     let scheduledTimer: TimerHandle;
-    scheduledTimer = schedule(() => {
-      if (expiryTimer === scheduledTimer) expiryTimer = null;
-      if (capturedToken !== workToken) return;
+    try {
+      scheduledTimer = schedule(() => {
+        if (expiryTimer === scheduledTimer) expiryTimer = null;
+        if (capturedToken !== workToken) return;
 
-      // Timers are capped and wall clocks can move backwards. Rearm until the
-      // exclusive Unix-seconds boundary has actually been reached.
-      const firedAt = nowSeconds();
-      if (Number.isFinite(firedAt) && firedAt < projection.freshUntil) {
-        armExpiry(projection, capturedToken);
-        return;
-      }
-      clear();
-    }, delayMs);
+        // Timers are capped and wall clocks can move backwards. Rearm until
+        // the exclusive Unix-seconds boundary has actually been reached.
+        const firedAt = nowSeconds();
+        if (Number.isFinite(firedAt) && firedAt < projection.freshUntil) {
+          if (
+            !armExpiry(projection, capturedToken) &&
+            capturedToken === workToken
+          ) {
+            clear();
+          }
+          return;
+        }
+        clear();
+      }, delayMs);
+    } catch {
+      return false;
+    }
     expiryTimer = scheduledTimer;
+    return true;
   };
 
   return {
@@ -156,9 +186,15 @@ export function createCurrentProjectionStore(
         return;
       }
 
+      // Arm passive expiry before making the projection observable. A timer
+      // host failure therefore cannot leave a current snapshot without an
+      // expiry path.
+      if (!armExpiry(projection, capturedToken)) {
+        if (capturedToken === workToken) clear();
+        return;
+      }
       snapshot = projection;
       emitChange();
-      armExpiry(projection, capturedToken);
     },
     clear,
   };

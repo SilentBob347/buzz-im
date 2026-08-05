@@ -24,11 +24,16 @@ function makeTimerHost(initialNow = 100) {
   const pending = new Map();
   const callbacks = new Map();
   const delays = [];
+  let schedulesToThrow = 0;
 
   return {
     options: {
       nowSeconds: () => now,
       setTimeout: (callback, delayMs) => {
+        if (schedulesToThrow > 0) {
+          schedulesToThrow -= 1;
+          throw new Error("synthetic scheduler failure");
+        }
         const id = nextId++;
         pending.set(id, callback);
         callbacks.set(id, callback);
@@ -45,6 +50,9 @@ function makeTimerHost(initialNow = 100) {
       callbacks.get(id)?.();
     },
     pendingIds: () => [...pending.keys()],
+    throwNextSchedules: (count = 1) => {
+      schedulesToThrow = count;
+    },
     delays,
   };
 }
@@ -164,6 +172,77 @@ test("invalid native input clears a current projection", () => {
 
   store.replaceFromNative(projection());
   store.replaceFromNative({ ...projection(), connectionEpoch: "" });
+  assert.equal(store.getSnapshot(), null);
+  assert.deepEqual(timers.pendingIds(), []);
+});
+
+test("a throwing subscriber cannot abort expiry or later subscribers", () => {
+  const timers = makeTimerHost(100);
+  const logCalls = [];
+  const store = createCurrentProjectionStore({
+    ...timers.options,
+    onListenerError: (...args) => logCalls.push(args),
+  });
+  const observed = [];
+
+  store.subscribe(() => {
+    assert.equal(
+      timers.pendingIds().length,
+      store.getSnapshot() === null ? 0 : 1,
+      "expiry is armed before a current snapshot is announced",
+    );
+    throw new Error("synthetic subscriber failure");
+  });
+  store.subscribe(() => observed.push(store.getSnapshot()));
+
+  store.replaceFromNative(projection({ freshUntil: 101 }));
+  assert.equal(store.getSnapshot()?.eventAuthorPubkey, AUTHOR_A);
+  assert.equal(observed.length, 1);
+  assert.deepEqual(logCalls, [[]], "logging receives no DTO or thrown value");
+
+  timers.setNow(101);
+  timers.fire(timers.pendingIds()[0]);
+  assert.equal(store.getSnapshot(), null);
+  assert.deepEqual(observed, [projection({ freshUntil: 101 }), null]);
+  assert.deepEqual(logCalls, [[], []]);
+});
+
+test("initial and replacement scheduler failures leave the store null", () => {
+  const timers = makeTimerHost(100);
+  const store = createCurrentProjectionStore(timers.options);
+
+  timers.throwNextSchedules();
+  store.replaceFromNative(projection({ freshUntil: 110 }));
+  assert.equal(store.getSnapshot(), null);
+  assert.deepEqual(timers.pendingIds(), []);
+
+  store.replaceFromNative(projection({ freshUntil: 110 }));
+  assert.notEqual(store.getSnapshot(), null);
+  timers.throwNextSchedules();
+  store.replaceFromNative(
+    projection({
+      eventAuthorPubkey: AUTHOR_B,
+      freshUntil: 120,
+      connectionEpoch: "opaque-epoch-b",
+    }),
+  );
+  assert.equal(store.getSnapshot(), null);
+  assert.deepEqual(timers.pendingIds(), []);
+});
+
+test("rearm scheduler failure clears the current projection", () => {
+  const timers = makeTimerHost(100);
+  const store = createCurrentProjectionStore({
+    ...timers.options,
+    maxTimerDelayMs: 1_000,
+  });
+
+  store.replaceFromNative(projection({ freshUntil: 103 }));
+  assert.notEqual(store.getSnapshot(), null);
+  timers.throwNextSchedules();
+  timers.setNow(100.5);
+  timers.fire(timers.pendingIds()[0]);
+
   assert.equal(store.getSnapshot(), null);
   assert.deepEqual(timers.pendingIds(), []);
 });
