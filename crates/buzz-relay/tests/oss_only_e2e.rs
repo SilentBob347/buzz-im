@@ -387,8 +387,9 @@ async fn websocket_http_fanout(config: &LiveConfig) -> Result<LiveScenario> {
     )
     .await?;
     let subscription_id = "oss-live-fanout";
+    let stream_kind = buzz_core::kind::KIND_STREAM_MESSAGE as u16;
     relay_b
-        .subscribe_channel(subscription_id, channel_id, 1)
+        .subscribe_channel(subscription_id, channel_id, stream_kind)
         .await?;
     let redis_channel = wait_for_redis_subscription(&config.redis_url, channel_id).await?;
     let redis_client = redis::Client::open(config.redis_url.as_str())
@@ -401,7 +402,7 @@ async fn websocket_http_fanout(config: &LiveConfig) -> Result<LiveScenario> {
         .subscribe(&redis_channel)
         .await
         .context("subscribe live OSS Redis diagnostic subscriber")?;
-    let event = EventBuilder::new(Kind::TextNote, "synthetic cross-relay fan-out")
+    let event = EventBuilder::new(Kind::Custom(stream_kind), "synthetic cross-relay fan-out")
         .tags([Tag::parse(["h", &channel_id.to_string()]).context("message h tag")?])
         .sign_with_keys(&owner)
         .context("sign synthetic fan-out event")?;
