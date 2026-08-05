@@ -15,6 +15,10 @@ const KIND_REGISTRY: &str = include_str!("../../buzz-core/src/kind.rs");
 const INGEST_HANDLER: &str = include_str!("../src/handlers/ingest.rs");
 const READ_ONLY_RELAY_CLIENT: &str =
     include_str!("../../../desktop/src/shared/api/readOnlyRelayClient.ts");
+const PRIMARY_RELAY_CLIENT: &str =
+    include_str!("../../../desktop/src/shared/api/relayClientSession.ts");
+const NATIVE_WEBSOCKET: &str = include_str!("../../../desktop/src-tauri/src/native_websocket.rs");
+const DESKTOP_BUILD: &str = include_str!("../../../desktop/src-tauri/build.rs");
 const WORKSPACE_COMMAND: &str =
     include_str!("../../../desktop/src-tauri/src/commands/workspace.rs");
 const IDENTITY_COMMAND: &str = include_str!("../../../desktop/src-tauri/src/commands/identity.rs");
@@ -456,6 +460,33 @@ fn auth_bootstrap_precedes_status_and_success_ack() {
     assert!(!include_str!("../src/router.rs").contains("CLIENT_BINDING_EPOCH_HEADER"));
     assert!(!READ_ONLY_RELAY_CLIENT.contains("onProjection"));
     assert!(!READ_ONLY_RELAY_CLIENT.contains("nativeWebsocketId"));
+}
+
+#[test]
+fn native_status_connect_is_dedicated_and_primary_composition_remains_pending() {
+    let ordinary = NATIVE_WEBSOCKET
+        .split("async fn connect(")
+        .nth(1)
+        .and_then(|suffix| suffix.split("#[tauri::command]").next())
+        .expect("ordinary native connect command exists");
+    let status = NATIVE_WEBSOCKET
+        .split("async fn connect_with_status(")
+        .nth(1)
+        .and_then(|suffix| suffix.split("async fn connect_internal(").next())
+        .expect("dedicated status connect command exists");
+
+    assert!(!ordinary.contains("on_projection"));
+    assert!(status.contains("on_projection: Channel<serde_json::Value>"));
+    assert!(!status.contains("Option<Channel<serde_json::Value>>"));
+    assert!(NATIVE_WEBSOCKET.contains("connect_with_status,"));
+    assert!(DESKTOP_BUILD.contains("\"connect_with_status\""));
+
+    // J0/J2 composition remains HOLD until the primary session opts into the
+    // dedicated seam and passes its returned native ID through NIP-42 AUTH.
+    assert!(PRIMARY_RELAY_CLIENT.contains("plugin:websocket|connect"));
+    assert!(!PRIMARY_RELAY_CLIENT.contains("plugin:websocket|connect_with_status"));
+    assert!(!PRIMARY_RELAY_CLIENT.contains("onProjection"));
+    assert!(!PRIMARY_RELAY_CLIENT.contains("nativeWebsocketId"));
 }
 
 #[test]

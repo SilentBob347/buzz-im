@@ -747,12 +747,40 @@ async fn connect(
     state: tauri::State<'_, AppState>,
     url: String,
     on_message: Channel<serde_json::Value>,
-    on_projection: Option<Channel<serde_json::Value>>,
     _config: Option<serde_json::Value>,
+) -> Result<Id, String> {
+    connect_internal(manager.inner(), state.inner(), url, on_message, None).await
+}
+
+#[tauri::command]
+async fn connect_with_status(
+    manager: tauri::State<'_, WebSocketManager>,
+    state: tauri::State<'_, AppState>,
+    url: String,
+    on_message: Channel<serde_json::Value>,
+    on_projection: Channel<serde_json::Value>,
+    _config: Option<serde_json::Value>,
+) -> Result<Id, String> {
+    connect_internal(
+        manager.inner(),
+        state.inner(),
+        url,
+        on_message,
+        Some(on_projection),
+    )
+    .await
+}
+
+async fn connect_internal(
+    manager: &WebSocketManager,
+    state: &AppState,
+    url: String,
+    on_message: Channel<serde_json::Value>,
+    on_projection: Option<Channel<serde_json::Value>>,
 ) -> Result<Id, String> {
     let connect_cancel = manager.current_connect_cancel().await;
     let status_candidate = on_projection.is_some()
-        && url == crate::relay::relay_ws_url_with_override(&state)
+        && url == crate::relay::relay_ws_url_with_override(state)
         && state.signing_keys().is_ok();
     let status_head = if status_candidate {
         manager.begin_status_attempt().await
@@ -764,7 +792,7 @@ async fn connect(
             _ = connect_cancel.cancelled() => {
                 return Err("WebSocket connection cancelled".to_string());
             }
-            prepared = prepare_status_session(&state, &url, channel, generation, attempt) => prepared,
+            prepared = prepare_status_session(state, &url, channel, generation, attempt) => prepared,
         },
         _ => None,
     };
@@ -776,14 +804,8 @@ async fn connect(
     {
         return Err("WebSocket connection scope changed".to_string());
     }
-    open_connection_with_projection(
-        manager.inner(),
-        &url,
-        on_message,
-        prepared_status,
-        connect_cancel,
-    )
-    .await
+    open_connection_with_projection(manager, &url, on_message, prepared_status, connect_cancel)
+        .await
 }
 
 async fn prepare_status_session(
@@ -1140,6 +1162,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
     tauri::plugin::Builder::new("websocket")
         .invoke_handler(tauri::generate_handler![
             connect,
+            connect_with_status,
             send,
             disconnect,
             disconnect_all
