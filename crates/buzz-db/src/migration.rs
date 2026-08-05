@@ -1012,25 +1012,41 @@ mod tests {
         let protected_domain_marker = migrations[35].sql.as_str();
         assert!(protected_domain_marker.contains("CREATE TABLE authorization_invalidation_domains"));
 
-        assert_eq!(migrations[40].version, 41);
-        let invalidation = migrations[40].sql.as_str();
+        assert_eq!(migrations[39].version, 40);
+        let invalidation = migrations[39].sql.as_str();
         assert!(invalidation.contains("CREATE TABLE authorization_invalidation_receipts"));
         assert!(invalidation.contains("CREATE TABLE authorization_invalidation_floors"));
 
-        assert_eq!(migrations[41].version, 42);
-        let operation_receipts = migrations[41].sql.as_str();
+        assert_eq!(migrations[40].version, 41);
+        let operation_receipts = migrations[40].sql.as_str();
         assert!(operation_receipts.contains("CREATE TABLE authorization_operation_receipts"));
         assert!(operation_receipts.contains("request_fingerprint"));
         assert!(operation_receipts.contains("result_payload"));
         assert!(operation_receipts.contains("authorization_operation_expiry_guard"));
 
-        assert_eq!(migrations[42].version, 43);
-        let authority_epochs = migrations[42].sql.as_str();
+        assert_eq!(migrations[41].version, 42);
+        let authority_epochs = migrations[41].sql.as_str();
         assert!(authority_epochs.contains("CREATE TABLE authorization_authority_epochs"));
         assert!(authority_epochs.contains("CREATE TABLE client_status_revisions"));
         assert!(authority_epochs.contains("advance_authorization_authority_epoch"));
+        assert!(authority_epochs.contains("IF TG_OP = 'DELETE'"));
+        assert!(authority_epochs.contains("domain_id := OLD.community_id"));
+        assert!(authority_epochs.contains("domain_id := NEW.community_id"));
         assert!(authority_epochs.contains("pg_trigger_depth() > 1"));
         assert!(authority_epochs.contains("ON DELETE CASCADE"));
+        let function_position = authority_epochs
+            .find("CREATE FUNCTION advance_authorization_authority_epoch")
+            .expect("authority epoch function exists");
+        for git_policy_trigger in [
+            "git_policy_insert_authority_epoch",
+            "git_policy_update_authority_epoch",
+            "git_policy_delete_authority_epoch",
+        ] {
+            let trigger_position = authority_epochs
+                .find(git_policy_trigger)
+                .expect("git policy authority trigger exists");
+            assert!(function_position < trigger_position);
+        }
         for protected_table in [
             "identity_bindings",
             "identity_principals",
@@ -1050,13 +1066,13 @@ mod tests {
             assert!(authority_epochs.contains(protected_table));
         }
 
-        assert_eq!(migrations[43].version, 44);
-        let client_status = migrations[43].sql.as_str();
+        assert_eq!(migrations[42].version, 43);
+        let client_status = migrations[42].sql.as_str();
         assert!(client_status.contains("ADD COLUMN supersedes_revision"));
         assert!(client_status.contains("client_status_revisions_withdrawal"));
 
-        assert_eq!(migrations[44].version, 45);
-        let projection_retirement = migrations[44].sql.as_str();
+        assert_eq!(migrations[43].version, 44);
+        let projection_retirement = migrations[43].sql.as_str();
         assert!(projection_retirement.contains("identity_public_projection_heads"));
         assert!(projection_retirement.contains("identity_public_projection_retirements"));
         assert!(projection_retirement.contains("source_binding_version"));
@@ -1064,8 +1080,8 @@ mod tests {
         assert!(!projection_retirement.contains("subject TEXT"));
         assert!(!projection_retirement.contains("display_name"));
 
-        assert_eq!(migrations[45].version, 46);
-        let delegated_relationship = migrations[45].sql.as_str();
+        assert_eq!(migrations[44].version, 45);
+        let delegated_relationship = migrations[44].sql.as_str();
         assert!(delegated_relationship.contains("delegated_relationship"));
         assert!(delegated_relationship
             .contains("authorization_invalidation_floors_selector_kind_check"));

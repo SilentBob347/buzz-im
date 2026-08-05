@@ -166,7 +166,7 @@ fn public_projection_retirement_is_durable_internal_and_not_operator_wired() {
         .next()
         .expect("production assertion verifier exists");
     let migration =
-        include_str!("../../../migrations/0045_identity_public_projection_retirement.sql");
+        include_str!("../../../migrations/0044_identity_public_projection_retirement.sql");
     assert!(migration.contains("identity_public_projection_retirements"));
     assert!(migration.contains("source_binding_id"));
     assert!(migration.contains("source_binding_version"));
