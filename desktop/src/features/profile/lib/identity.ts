@@ -26,6 +26,19 @@ export function formatVerifiedUserLabel(
   return chosen || verified || null;
 }
 
+export function formatVerifiedProfileLabel(
+  profile:
+    | Pick<Profile, "displayName" | "verifiedName" | "verifiedNameExpiresAt">
+    | null
+    | undefined,
+): string | null {
+  return formatVerifiedUserLabel(
+    profile?.displayName,
+    profile?.verifiedName,
+    profile?.verifiedNameExpiresAt,
+  );
+}
+
 /**
  * Deep-equal two profile lookups by value. Used to stabilise the merged
  * `messageProfiles` reference at the ChannelScreen boundary: the underlying
