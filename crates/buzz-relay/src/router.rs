@@ -763,4 +763,37 @@ mod tests {
             "oversized messages must be rejected by the WebSocket parser before the handler sees them"
         );
     }
+
+    #[test]
+    fn client_binding_epoch_header_is_absent_or_one_exact_canonical_value() {
+        let epoch = "11".repeat(32);
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_binding_epoch_from_headers(&headers), Ok(None));
+
+        headers.insert(
+            CLIENT_BINDING_EPOCH_HEADER,
+            axum::http::HeaderValue::from_str(&epoch).expect("canonical header value"),
+        );
+        assert_eq!(
+            client_binding_epoch_from_headers(&headers),
+            Ok(Some(
+                ClientBindingEpoch::parse(&epoch).expect("canonical epoch")
+            ))
+        );
+
+        for invalid in ["AA".repeat(32), "11".repeat(31), format!("{epoch},x")] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CLIENT_BINDING_EPOCH_HEADER,
+                axum::http::HeaderValue::from_str(&invalid).expect("HTTP-safe test value"),
+            );
+            assert_eq!(client_binding_epoch_from_headers(&headers), Err(()));
+        }
+
+        let mut duplicated = HeaderMap::new();
+        let value = axum::http::HeaderValue::from_str(&epoch).expect("canonical header value");
+        duplicated.append(CLIENT_BINDING_EPOCH_HEADER, value.clone());
+        duplicated.append(CLIENT_BINDING_EPOCH_HEADER, value);
+        assert_eq!(client_binding_epoch_from_headers(&duplicated), Err(()));
+    }
 }

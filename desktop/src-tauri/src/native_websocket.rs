@@ -718,8 +718,11 @@ async fn current_projection(
 mod tests {
     use super::*;
     use futures_util::FutureExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use buzz_core_pkg::client_binding_bootstrap::{
+        CLIENT_BINDING_BOOTSTRAP_SUB_ID, CLIENT_BINDING_STATUS_SUB_ID,
+    };
     use tauri::ipc::InvokeResponseBody;
     use tokio::io::duplex;
     use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
@@ -928,5 +931,208 @@ mod tests {
         .unwrap();
         assert!(healthy_receiver.recv().await.is_some());
         drop(blocked_receiver);
+    }
+
+    #[test]
+    fn nip11_url_accepts_tls_or_loopback_only() {
+        assert_eq!(
+            nip11_url("wss://relay.example.test/community?view=1")
+                .expect("secure relay URL is eligible")
+                .as_str(),
+            "https://relay.example.test/community?view=1"
+        );
+        assert_eq!(
+            nip11_url("ws://localhost:3000/")
+                .expect("localhost relay URL is eligible")
+                .as_str(),
+            "http://localhost:3000/"
+        );
+        assert!(nip11_url("ws://127.0.0.1:3000/").is_ok());
+        assert!(nip11_url("ws://[::1]:3000/").is_ok());
+        assert!(nip11_url("ws://relay.example.test/").is_err());
+        assert!(nip11_url("http://localhost:3000/").is_err());
+
+        assert!(is_loopback_url(
+            &Url::parse("ws://LOCALHOST:3000/").expect("test URL")
+        ));
+        assert!(!is_loopback_url(
+            &Url::parse("ws://localhost.example.test/").expect("test URL")
+        ));
+    }
+
+    #[tokio::test]
+    async fn projection_generation_and_owner_epoch_fence_late_updates() {
+        let manager = WebSocketManager::default();
+        let stale_generation = manager.begin_projection_attempt().await;
+        let current_generation = manager.begin_projection_attempt().await;
+        let stale_epoch = ClientBindingEpoch::from_random_bytes([0x11; 32]);
+        let current_epoch = ClientBindingEpoch::from_random_bytes([0x22; 32]);
+
+        assert!(
+            !manager
+                .activate_projection(stale_generation, 1, stale_epoch.clone(), silent_channel(),)
+                .await
+        );
+        assert!(
+            manager
+                .activate_projection(
+                    current_generation,
+                    2,
+                    current_epoch.clone(),
+                    silent_channel(),
+                )
+                .await
+        );
+        let current = CurrentProjection {
+            event_author_pubkey: "11".repeat(32),
+            fresh_until: u64::MAX,
+            connection_epoch: current_epoch.as_str().to_owned(),
+        };
+
+        manager
+            .apply_projection_update(1, &stale_epoch, ProjectionUpdate::Current(current.clone()))
+            .await;
+        assert!(manager.projection.lock().await.current.is_none());
+        manager
+            .apply_projection_update(2, &stale_epoch, ProjectionUpdate::Current(current.clone()))
+            .await;
+        assert!(manager.projection.lock().await.current.is_none());
+        manager
+            .apply_projection_update(
+                2,
+                &current_epoch,
+                ProjectionUpdate::Current(current.clone()),
+            )
+            .await;
+        assert_eq!(manager.projection.lock().await.current, Some(current));
+
+        let next_generation = manager.begin_projection_attempt().await;
+        assert!(manager.projection.lock().await.current.is_none());
+        assert!(
+            manager
+                .activate_projection(
+                    next_generation,
+                    3,
+                    ClientBindingEpoch::from_random_bytes([0x33; 32]),
+                    silent_channel(),
+                )
+                .await
+        );
+        manager
+            .apply_projection_update(
+                2,
+                &current_epoch,
+                ProjectionUpdate::Current(CurrentProjection {
+                    event_author_pubkey: "22".repeat(32),
+                    fresh_until: u64::MAX,
+                    connection_epoch: current_epoch.as_str().to_owned(),
+                }),
+            )
+            .await;
+        assert!(manager.projection.lock().await.current.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_task_cannot_remove_reused_connection_id() {
+        let manager = WebSocketManager::default();
+        let (old_sender, _old_receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let old = Arc::new(ConnectionHandle {
+            sender: old_sender,
+            cancel: CancellationToken::new(),
+            task: Mutex::new(None),
+        });
+        let (new_sender, _new_receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let current = Arc::new(ConnectionHandle {
+            sender: new_sender,
+            cancel: CancellationToken::new(),
+            task: Mutex::new(None),
+        });
+        manager.connections.lock().await.insert(9, old.clone());
+        manager.connections.lock().await.insert(9, current.clone());
+
+        manager.remove_if_current(9, &old).await;
+        assert!(manager
+            .connections
+            .lock()
+            .await
+            .get(&9)
+            .is_some_and(|handle| Arc::ptr_eq(handle, &current)));
+        manager.remove_if_current(9, &current).await;
+        assert!(!manager.connections.lock().await.contains_key(&9));
+    }
+
+    #[tokio::test]
+    async fn reserved_frames_are_swallowed_without_an_eligible_session() {
+        let manager = WebSocketManager::default();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_for_channel = delivered.clone();
+        let channel = Channel::new(move |_: InvokeResponseBody| {
+            delivered_for_channel.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let (client_io, server_io) = duplex(4096);
+        let (client, mut server) = tokio::join!(
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None),
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None),
+        );
+        let (sender, receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle {
+            sender,
+            cancel: CancellationToken::new(),
+            task: Mutex::new(None),
+        });
+        manager.connections.lock().await.insert(42, handle.clone());
+        let task = tauri::async_runtime::spawn(run_connection(
+            42,
+            client,
+            receiver,
+            handle.cancel.clone(),
+            channel,
+            manager.clone(),
+        ));
+        *handle.task.lock().await = Some(task);
+
+        server
+            .send(Message::Text(
+                serde_json::json!(["EVENT", CLIENT_BINDING_BOOTSTRAP_SUB_ID])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send reserved bootstrap frame");
+        server
+            .send(Message::Binary(
+                serde_json::json!(["EVENT", CLIENT_BINDING_STATUS_SUB_ID, "malformed"])
+                    .to_string()
+                    .into_bytes()
+                    .into(),
+            ))
+            .await
+            .expect("send reserved status frame");
+        server
+            .send(Message::Text("ordinary".into()))
+            .await
+            .expect("send ordinary frame");
+        server
+            .send(Message::Close(None))
+            .await
+            .expect("close synthetic socket");
+
+        let task = handle
+            .task
+            .lock()
+            .await
+            .take()
+            .expect("connection task is registered");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("connection loop exits")
+            .expect("connection task joins");
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            2,
+            "only the ordinary text and terminal close reach raw delivery"
+        );
+        assert!(!manager.connections.lock().await.contains_key(&42));
     }
 }

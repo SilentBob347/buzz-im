@@ -322,3 +322,190 @@ pub enum ClientBindingBootstrapBuildError {
     #[error("client binding bootstrap signing failed")]
     Signing,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::JsonUtil;
+    use serde_json::{json, Value};
+
+    const DOMAIN: &str = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+    const ISSUED_AT: u64 = 1_800_000_000;
+
+    fn domain() -> CommunityId {
+        CommunityId::from_uuid(Uuid::parse_str(DOMAIN).expect("synthetic domain is valid"))
+    }
+
+    fn epoch(byte: u8) -> ClientBindingEpoch {
+        ClientBindingEpoch::from_random_bytes([byte; 32])
+    }
+
+    fn signed_bootstrap(relay: &Keys, author: PublicKey) -> Event {
+        ClientBindingBootstrapInputV1::new(domain(), author, epoch(0x11), ISSUED_AT)
+            .expect("synthetic bootstrap input is valid")
+            .sign_with_relay_keys(relay)
+            .expect("synthetic bootstrap signs")
+    }
+
+    fn validate(
+        event: &Event,
+        relay: &Keys,
+        author: &Keys,
+        expected_epoch: &ClientBindingEpoch,
+        now: u64,
+    ) -> Result<ClientBindingBootstrapV1, ClientBindingBootstrapError> {
+        validate_client_binding_bootstrap_event(
+            event,
+            &relay.public_key(),
+            expected_epoch,
+            &author.public_key(),
+            now,
+        )
+    }
+
+    fn resign_payload(relay: &Keys, payload: Value) -> Event {
+        EventBuilder::new(
+            Kind::Custom(KIND_CLIENT_BINDING_BOOTSTRAP as u16),
+            payload.to_string(),
+        )
+        .tags([])
+        .custom_created_at(Timestamp::from(ISSUED_AT))
+        .sign_with_keys(relay)
+        .expect("synthetic bootstrap variant signs")
+    }
+
+    #[test]
+    fn relay_authenticated_bootstrap_roundtrips_exact_authority() {
+        let relay = Keys::generate();
+        let author = Keys::generate();
+        let expected_epoch = epoch(0x11);
+        let event = signed_bootstrap(&relay, author.public_key());
+
+        let bootstrap = validate(&event, &relay, &author, &expected_epoch, ISSUED_AT)
+            .expect("synthetic bootstrap validates");
+
+        assert_eq!(event.kind.as_u16() as u32, KIND_CLIENT_BINDING_BOOTSTRAP);
+        assert!(event.tags.is_empty());
+        assert_eq!(bootstrap.authorization_domain(), domain());
+        assert_eq!(bootstrap.event_author_pubkey(), author.public_key());
+        assert_eq!(bootstrap.connection_epoch(), &expected_epoch);
+        assert_eq!(bootstrap.issued_at(), ISSUED_AT);
+        let payload: Value = serde_json::from_str(&event.content).expect("payload parses");
+        assert_eq!(
+            payload
+                .as_object()
+                .expect("payload is an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "authorization_domain",
+                "connection_epoch",
+                "event_author_pubkey",
+                "issued_at",
+                "version",
+            ])
+        );
+        let debug = format!("{bootstrap:?}");
+        assert!(!debug.contains(DOMAIN));
+        assert!(!debug.contains(&author.public_key().to_hex()));
+        assert!(!debug.contains(expected_epoch.as_str()));
+    }
+
+    #[test]
+    fn bootstrap_rejects_noncanonical_epoch_and_invalid_input_bounds() {
+        assert_eq!(
+            ClientBindingEpoch::parse(&"A".repeat(64)),
+            Err(ClientBindingBootstrapError::InvalidConnectionEpoch)
+        );
+        assert_eq!(
+            ClientBindingEpoch::parse(&"a".repeat(63)),
+            Err(ClientBindingBootstrapError::InvalidConnectionEpoch)
+        );
+        assert_eq!(
+            ClientBindingBootstrapInputV1::new(
+                CommunityId::from_uuid(Uuid::nil()),
+                Keys::generate().public_key(),
+                epoch(1),
+                ISSUED_AT,
+            )
+            .expect_err("nil domains are invalid"),
+            ClientBindingBootstrapError::InvalidAuthorizationDomain
+        );
+        assert_eq!(
+            ClientBindingBootstrapInputV1::new(
+                domain(),
+                Keys::generate().public_key(),
+                epoch(1),
+                0,
+            )
+            .expect_err("zero issue time is invalid"),
+            ClientBindingBootstrapError::InvalidIssueTime
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_wrong_scope_tampering_and_unknown_shape() {
+        let relay = Keys::generate();
+        let wrong_relay = Keys::generate();
+        let author = Keys::generate();
+        let other_author = Keys::generate();
+        let expected_epoch = epoch(0x11);
+        let event = signed_bootstrap(&relay, author.public_key());
+
+        assert_eq!(
+            validate(&event, &wrong_relay, &author, &expected_epoch, ISSUED_AT),
+            Err(ClientBindingBootstrapError::UnexpectedRelay)
+        );
+        assert_eq!(
+            validate(&event, &relay, &other_author, &expected_epoch, ISSUED_AT),
+            Err(ClientBindingBootstrapError::EventAuthorMismatch)
+        );
+        assert_eq!(
+            validate(&event, &relay, &author, &epoch(0x22), ISSUED_AT),
+            Err(ClientBindingBootstrapError::ConnectionEpochMismatch)
+        );
+        assert_eq!(
+            validate(&event, &relay, &author, &expected_epoch, ISSUED_AT - 1),
+            Err(ClientBindingBootstrapError::NotYetValid)
+        );
+
+        let mut tampered_json: Value =
+            serde_json::from_str(&event.as_json()).expect("event parses");
+        tampered_json["content"] = Value::String("{}".to_string());
+        let tampered =
+            Event::from_json(tampered_json.to_string()).expect("tampered event still parses");
+        assert_eq!(
+            validate(&tampered, &relay, &author, &expected_epoch, ISSUED_AT),
+            Err(ClientBindingBootstrapError::UnauthenticatedEvent)
+        );
+
+        let mut payload: Value =
+            serde_json::from_str(&event.content).expect("bootstrap content parses");
+        payload["synthetic_extension"] = json!(true);
+        assert_eq!(
+            validate(
+                &resign_payload(&relay, payload),
+                &relay,
+                &author,
+                &expected_epoch,
+                ISSUED_AT,
+            ),
+            Err(ClientBindingBootstrapError::MalformedPayload)
+        );
+
+        let mut payload: Value =
+            serde_json::from_str(&event.content).expect("bootstrap content parses");
+        payload["authorization_domain"] = json!(DOMAIN.to_uppercase());
+        assert_eq!(
+            validate(
+                &resign_payload(&relay, payload),
+                &relay,
+                &author,
+                &expected_epoch,
+                ISSUED_AT,
+            ),
+            Err(ClientBindingBootstrapError::InvalidAuthorizationDomain)
+        );
+    }
+}

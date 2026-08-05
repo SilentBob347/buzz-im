@@ -318,6 +318,22 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
                 continue;
             }
             let source = fs::read_to_string(&file).expect("source file is readable");
+            let native_consumer = file
+                == repo.join("desktop/src-tauri/src/client_binding_status_session.rs")
+                || file == repo.join("desktop/src-tauri/src/native_websocket.rs");
+            let native_module_declaration = file == repo.join("desktop/src-tauri/src/lib.rs");
+            if native_module_declaration {
+                assert_eq!(
+                    source.matches("mod client_binding_status_session;").count(),
+                    1,
+                    "native status module must have one private declaration"
+                );
+            }
+            let source_to_scan = if native_module_declaration {
+                source.replacen("mod client_binding_status_session;", "", 1)
+            } else {
+                source.clone()
+            };
             for forbidden in [
                 "KIND_CLIENT_BINDING_STATUS",
                 "ClientBindingStatus",
@@ -325,8 +341,13 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
                 "24244",
                 "deliver_verification_only",
             ] {
+                if native_consumer
+                    && matches!(forbidden, "ClientBindingStatus" | "client_binding_status")
+                {
+                    continue;
+                }
                 assert!(
-                    !source.contains(forbidden),
+                    !source_to_scan.contains(forbidden),
                     "{} exposes status through an ordinary route {forbidden}",
                     file.display()
                 );
@@ -353,6 +374,26 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
     assert!(nip11.contains("with_conformant_federated_identity"));
     assert!(router.contains("nip11_document(&state, raw_host).await"));
     assert!(!status.contains("std::env"));
+}
+
+#[test]
+fn auth_bootstrap_precedes_status_and_success_ack() {
+    let bootstrap = AUTH_HANDLER
+        .find("conn.send(RelayMessage::event(CLIENT_BINDING_BOOTSTRAP_SUB_ID, &event))")
+        .expect("AUTH queues the exact-connection bootstrap");
+    let presentation = AUTH_HANDLER
+        .find(".present_after_auth(")
+        .expect("AUTH invokes O4 presentation");
+    let success = AUTH_HANDLER
+        .find("conn.send(RelayMessage::ok(&event_id_hex, true, \"\"))")
+        .expect("AUTH queues the successful NIP-42 acknowledgement");
+
+    assert!(
+        bootstrap < presentation && presentation < success,
+        "bootstrap must be queued before O4 status and the NIP-42 OK"
+    );
+    assert!(AUTH_HANDLER.contains("if let (Some(runtime), Some(assertion), Some(epoch)) ="));
+    assert!(AUTH_HANDLER.contains("let presentation = if bootstrap_queued"));
 }
 
 #[test]

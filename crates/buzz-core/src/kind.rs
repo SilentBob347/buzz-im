@@ -916,7 +916,9 @@ mod tests {
     }
 
     #[test]
-    fn client_binding_status_is_relay_only() {
+    fn client_binding_connection_events_are_relay_only_and_ephemeral() {
+        assert!(is_relay_only_kind(KIND_CLIENT_BINDING_BOOTSTRAP));
+        assert!(is_ephemeral(KIND_CLIENT_BINDING_BOOTSTRAP));
         assert!(is_relay_only_kind(KIND_CLIENT_BINDING_STATUS));
         assert!(is_ephemeral(KIND_CLIENT_BINDING_STATUS));
     }
