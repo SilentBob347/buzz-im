@@ -136,7 +136,8 @@ pub enum OperatorReasonCode {
 }
 
 impl OperatorReasonCode {
-    fn discriminant(self) -> u16 {
+    /// Numeric representation frozen by the provider-neutral lifecycle contract.
+    pub const fn discriminant(self) -> u16 {
         match self {
             Self::Offboarding => 1,
             Self::CompromiseContainment => 2,
@@ -410,15 +411,21 @@ pub struct OperatorAuthorizationRequest {
     operation_id: Uuid,
     capability: OperatorCapability,
     intent_fingerprint: [u8; 32],
+    replacement_reference: Option<OpaqueOperatorReference>,
 }
 
 impl OperatorAuthorizationRequest {
     fn from_invocation(invocation: &OperatorInvocation) -> Self {
+        let replacement_reference = match invocation.intent {
+            OperatorIntent::Rotate { replacement, .. } => Some(replacement),
+            _ => None,
+        };
         Self {
             domain_id: invocation.context.domain_id,
             operation_id: invocation.context.operation_id,
             capability: invocation.intent.action().capability(),
             intent_fingerprint: invocation.fingerprint,
+            replacement_reference,
         }
     }
 
@@ -441,10 +448,64 @@ impl OperatorAuthorizationRequest {
     pub const fn intent_fingerprint(self) -> [u8; 32] {
         self.intent_fingerprint
     }
+
+    /// Requested replacement reference when a rotation needs fresh proof.
+    pub const fn replacement_reference(self) -> Option<OpaqueOperatorReference> {
+        self.replacement_reference
+    }
+}
+
+/// Fresh replacement material supplied only by an authenticated rotation grant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GrantedOperatorReplacement {
+    reference: OpaqueOperatorReference,
+    public_key: [u8; 32],
+    policy_digest: [u8; 32],
+}
+
+impl GrantedOperatorReplacement {
+    /// Bind a proven replacement key and policy revision to an opaque reference.
+    pub fn new(
+        reference: OpaqueOperatorReference,
+        public_key: [u8; 32],
+        policy_digest: [u8; 32],
+    ) -> Result<Self, OperatorRuntimeError> {
+        if reference.is_zero() || public_key == [0; 32] || policy_digest == [0; 32] {
+            return Err(OperatorRuntimeError::InvalidAuthority);
+        }
+        Ok(Self {
+            reference,
+            public_key,
+            policy_digest,
+        })
+    }
+
+    /// Opaque replacement identity bound into the requested intent.
+    pub const fn reference(self) -> OpaqueOperatorReference {
+        self.reference
+    }
+
+    /// Fresh public key proven by the authenticator.
+    pub const fn public_key(self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// Digest of the policy revision that authorized the replacement.
+    pub const fn policy_digest(self) -> [u8; 32] {
+        self.policy_digest
+    }
+}
+
+impl fmt::Debug for GrantedOperatorReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GrantedOperatorReplacement([redacted])")
+    }
 }
 
 /// Authenticated capability grant returned by a deployment-owned verifier.
 pub trait GrantedOperatorCapability: Send + Sync {
+    /// Single-use authority evidence identity.
+    fn authority_evidence_id(&self) -> Uuid;
     /// Authorization domain bound by the grant.
     fn domain_id(&self) -> Uuid;
     /// Stable operation identity bound by the grant.
@@ -455,6 +516,10 @@ pub trait GrantedOperatorCapability: Send + Sync {
     fn actor_reference(&self) -> OpaqueOperatorReference;
     /// Pseudonymous credential/provenance reference stored in durable evidence.
     fn provenance_reference(&self) -> OpaqueOperatorReference;
+    /// Single-use approval evidence identities, parallel to request approvals.
+    fn approval_evidence_ids(&self) -> &[Uuid];
+    /// Fresh replacement proof for an exact rotate intent, if any.
+    fn replacement(&self) -> Option<GrantedOperatorReplacement>;
     /// Exclusive trusted expiry in Unix seconds.
     fn expires_at_unix_seconds(&self) -> u64;
     /// Whether this grant permits the exact closed capability.
@@ -482,12 +547,62 @@ pub trait OperatorClock: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedOperatorOperation {
     invocation: OperatorInvocation,
+    authority_evidence_id: Uuid,
     actor_reference: OpaqueOperatorReference,
     provenance_reference: OpaqueOperatorReference,
+    approval_evidence_ids: Box<[Uuid]>,
+    expires_at_unix_seconds: u64,
+    replacement: Option<GrantedOperatorReplacement>,
 }
 
 impl AuthorizedOperatorOperation {
     /// Authenticated invocation.
+    pub const fn invocation(&self) -> &OperatorInvocation {
+        &self.invocation
+    }
+
+    /// Single-use authority evidence identity.
+    pub const fn authority_evidence_id(&self) -> Uuid {
+        self.authority_evidence_id
+    }
+
+    /// Pseudonymous actor reference.
+    pub const fn actor_reference(&self) -> OpaqueOperatorReference {
+        self.actor_reference
+    }
+
+    /// Pseudonymous credential/provenance reference.
+    pub const fn provenance_reference(&self) -> OpaqueOperatorReference {
+        self.provenance_reference
+    }
+
+    /// Single-use approval evidence identities.
+    pub fn approval_evidence_ids(&self) -> &[Uuid] {
+        &self.approval_evidence_ids
+    }
+
+    /// Exclusive trusted authority expiry.
+    pub const fn expires_at_unix_seconds(&self) -> u64 {
+        self.expires_at_unix_seconds
+    }
+
+    /// Fresh replacement material for a rotate operation.
+    pub const fn replacement(&self) -> Option<GrantedOperatorReplacement> {
+        self.replacement
+    }
+}
+
+/// Authenticated denial facts accepted by the independent durable recorder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedOperatorDenial {
+    invocation: OperatorInvocation,
+    actor_reference: OpaqueOperatorReference,
+    provenance_reference: OpaqueOperatorReference,
+    reason: OperatorRuntimeError,
+}
+
+impl AuthenticatedOperatorDenial {
+    /// Denied invocation.
     pub const fn invocation(&self) -> &OperatorInvocation {
         &self.invocation
     }
@@ -500,6 +615,11 @@ impl AuthorizedOperatorOperation {
     /// Pseudonymous credential/provenance reference.
     pub const fn provenance_reference(&self) -> OpaqueOperatorReference {
         self.provenance_reference
+    }
+
+    /// Closed denial reason.
+    pub const fn reason(&self) -> OperatorRuntimeError {
+        self.reason
     }
 }
 
@@ -624,6 +744,12 @@ pub trait DurableOperatorExecutor: Send + Sync {
         &self,
         operation: AuthorizedOperatorOperation,
     ) -> Result<OperatorOutcome, OperatorRuntimeError>;
+
+    /// Record one authenticated denial without performing a lifecycle mutation.
+    async fn record_denial(
+        &self,
+        denial: AuthenticatedOperatorDenial,
+    ) -> Result<(), OperatorRuntimeError>;
 }
 
 /// Explicit composition root for the disabled operator lifecycle surface.
@@ -657,27 +783,83 @@ impl OperatorRuntime {
         let grant = self.authenticator.authenticate(credential, request).await?;
         let required = invocation.intent.action().capability();
         let now = self.clock.now_unix_seconds()?;
-        if grant.domain_id() != invocation.context.domain_id {
-            return Err(OperatorRuntimeError::CrossDomain);
-        }
-        if grant.operation_id() != invocation.context.operation_id
-            || grant.intent_fingerprint() != invocation.fingerprint
-        {
-            return Err(OperatorRuntimeError::InvalidAuthority);
-        }
-        if grant.expires_at_unix_seconds() <= now {
-            return Err(OperatorRuntimeError::StaleAuthority);
-        }
-        if !grant.permits(required) {
-            return Err(OperatorRuntimeError::MissingCapability);
-        }
         let actor_reference = grant.actor_reference();
         let provenance_reference = grant.provenance_reference();
         if actor_reference.is_zero()
             || provenance_reference.is_zero()
             || actor_reference == provenance_reference
         {
+            tracing::warn!(
+                reason = OperatorRuntimeError::InvalidAuthority.code(),
+                "operator denial could not be durably attributed"
+            );
             return Err(OperatorRuntimeError::InvalidAuthority);
+        }
+        let deny = |reason| AuthenticatedOperatorDenial {
+            invocation: invocation.clone(),
+            actor_reference,
+            provenance_reference,
+            reason,
+        };
+        if grant.domain_id() != invocation.context.domain_id {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::CrossDomain))
+                .await;
+        }
+        if grant.operation_id() != invocation.context.operation_id
+            || grant.intent_fingerprint() != invocation.fingerprint
+        {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::InvalidAuthority))
+                .await;
+        }
+        if grant.expires_at_unix_seconds() <= now {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::StaleAuthority))
+                .await;
+        }
+        if !grant.permits(required) {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::MissingCapability))
+                .await;
+        }
+        let authority_evidence_id = grant.authority_evidence_id();
+        let approval_evidence_ids = grant.approval_evidence_ids();
+        let approvals = invocation.context.approval_references();
+        let mut approval_ids = approval_evidence_ids.to_vec();
+        approval_ids.sort_unstable();
+        let invalid_approval_ids = authority_evidence_id.is_nil()
+            || approval_evidence_ids.len() != approvals.len()
+            || approval_evidence_ids.iter().any(Uuid::is_nil)
+            || approval_ids.windows(2).any(|pair| pair[0] == pair[1]);
+        if invalid_approval_ids {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::InvalidAuthority))
+                .await;
+        }
+        if matches!(
+            invocation.intent.action(),
+            OperatorAction::Revoke | OperatorAction::Rotate
+        ) && approvals.is_empty()
+        {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::MissingApproval))
+                .await;
+        }
+        if approvals.contains(&actor_reference) {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::SelfApproval))
+                .await;
+        }
+        let replacement = grant.replacement();
+        let expected_replacement = match invocation.intent {
+            OperatorIntent::Rotate { replacement, .. } => Some(replacement),
+            _ => None,
+        };
+        if replacement.map(GrantedOperatorReplacement::reference) != expected_replacement {
+            return self
+                .reject_authenticated(deny(OperatorRuntimeError::InvalidAuthority))
+                .await;
         }
         let expected_operation_id = invocation.context.operation_id;
         let expected_correlation_id = invocation.context.correlation_id;
@@ -686,8 +868,12 @@ impl OperatorRuntime {
             .executor
             .execute_idempotent(AuthorizedOperatorOperation {
                 invocation,
+                authority_evidence_id,
                 actor_reference,
                 provenance_reference,
+                approval_evidence_ids: approval_evidence_ids.to_vec().into_boxed_slice(),
+                expires_at_unix_seconds: grant.expires_at_unix_seconds(),
+                replacement,
             })
             .await?;
         if outcome.operation_id() != expected_operation_id
@@ -697,6 +883,20 @@ impl OperatorRuntime {
             return Err(OperatorRuntimeError::ExecutorContract);
         }
         Ok(outcome)
+    }
+
+    async fn reject_authenticated(
+        &self,
+        denial: AuthenticatedOperatorDenial,
+    ) -> Result<OperatorOutcome, OperatorRuntimeError> {
+        let reason = denial.reason();
+        if self.executor.record_denial(denial).await.is_err() {
+            tracing::warn!(
+                reason = reason.code(),
+                "operator denial evidence unavailable; request remains denied"
+            );
+        }
+        Err(reason)
     }
 }
 
@@ -724,6 +924,15 @@ pub enum OperatorRuntimeError {
     /// Authenticated authority lacks the exact capability.
     #[error("operator capability is missing")]
     MissingCapability,
+    /// A mutating lifecycle operation lacks independent approval evidence.
+    #[error("operator independent approval is required")]
+    MissingApproval,
+    /// The authenticated actor attempted to approve its own operation.
+    #[error("operator approval is not independent")]
+    SelfApproval,
+    /// Single-use authority or approval evidence was already consumed.
+    #[error("operator authority evidence was replayed")]
+    ReplayedAuthority,
     /// Authenticated grant contains invalid evidence references.
     #[error("operator authority is invalid")]
     InvalidAuthority,
@@ -749,6 +958,9 @@ impl OperatorRuntimeError {
             Self::CrossDomain => "operator_cross_domain_denied",
             Self::StaleAuthority => "operator_authority_stale",
             Self::MissingCapability => "operator_capability_missing",
+            Self::MissingApproval => "operator_approval_missing",
+            Self::SelfApproval => "operator_self_approval_denied",
+            Self::ReplayedAuthority => "operator_authority_replayed",
             Self::InvalidAuthority => "operator_authority_invalid",
             Self::IdempotencyConflict => "operator_idempotency_conflict",
             Self::StorageUnavailable => "operator_storage_unavailable",

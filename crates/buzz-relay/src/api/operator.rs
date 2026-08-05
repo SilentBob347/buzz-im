@@ -655,6 +655,9 @@ fn lifecycle_error(error: OperatorRuntimeError) -> (StatusCode, Json<Value>) {
         OperatorRuntimeError::CrossDomain
         | OperatorRuntimeError::StaleAuthority
         | OperatorRuntimeError::MissingCapability
+        | OperatorRuntimeError::MissingApproval
+        | OperatorRuntimeError::SelfApproval
+        | OperatorRuntimeError::ReplayedAuthority
         | OperatorRuntimeError::InvalidAuthority => StatusCode::FORBIDDEN,
         OperatorRuntimeError::InvalidRequest => StatusCode::BAD_REQUEST,
         OperatorRuntimeError::IdempotencyConflict => StatusCode::CONFLICT,
