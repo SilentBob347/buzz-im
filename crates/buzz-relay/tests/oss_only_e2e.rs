@@ -41,6 +41,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone)]
 struct LiveConfig {
     database_url: String,
+    redis_url: String,
     relay_identity: String,
     relay_a_ws: String,
     relay_b_ws: String,
@@ -60,6 +61,7 @@ impl LiveConfig {
         let relay_identity = env_or("OSS_E2E_RELAY_IDENTITY", "ws://127.0.0.1:3301");
         Ok(Self {
             database_url: required_env("BUZZ_TEST_DATABASE_URL")?,
+            redis_url: required_env("REDIS_URL")?,
             relay_a_ws: env_or("OSS_E2E_RELAY_A_WS", "ws://127.0.0.1:3301"),
             relay_b_ws: env_or("OSS_E2E_RELAY_B_WS", "ws://127.0.0.1:3302"),
             relay_a_http: env_or("OSS_E2E_RELAY_A_HTTP", "http://127.0.0.1:3301"),
@@ -154,10 +156,6 @@ impl RelaySocket {
         ]))
         .await?;
         self.wait_for_eose(subscription_id).await?;
-        // Topic retention is demand-driven and the Redis PSUBSCRIBE command is
-        // asynchronous. Match the repository's Redis round-trip proof by
-        // giving that acknowledgement one bounded scheduling window.
-        tokio::time::sleep(Duration::from_millis(200)).await;
         Ok(())
     }
 
@@ -392,6 +390,7 @@ async fn websocket_http_fanout(config: &LiveConfig) -> Result<LiveScenario> {
     relay_b
         .subscribe_channel(subscription_id, channel_id, 1)
         .await?;
+    wait_for_redis_subscription(&config.redis_url, channel_id).await?;
     let event = EventBuilder::new(Kind::TextNote, "synthetic cross-relay fan-out")
         .tags([Tag::parse(["h", &channel_id.to_string()]).context("message h tag")?])
         .sign_with_keys(&owner)
@@ -410,6 +409,36 @@ async fn websocket_http_fanout(config: &LiveConfig) -> Result<LiveScenario> {
     )
     .context("write bounded synthetic restart state")?;
     Ok(LiveScenario { owner, channel_id })
+}
+
+async fn wait_for_redis_subscription(redis_url: &str, channel_id: Uuid) -> Result<()> {
+    let client = redis::Client::open(redis_url).context("open live OSS Redis client")?;
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .context("connect live OSS Redis client")?;
+    let pattern = format!("buzz:*:channel:{channel_id}");
+    let expected_suffix = format!(":channel:{channel_id}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let channels: Vec<String> = redis::cmd("PUBSUB")
+            .arg("CHANNELS")
+            .arg(&pattern)
+            .query_async(&mut connection)
+            .await
+            .context("query live Redis subscriptions")?;
+        if channels
+            .iter()
+            .any(|channel| channel.ends_with(&expected_suffix))
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("relay B did not acknowledge scoped Redis subscription {pattern}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn post_event(config: &LiveConfig, event: &Event) -> Result<()> {
