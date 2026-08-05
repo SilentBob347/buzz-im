@@ -1587,6 +1587,8 @@ async fn replacement_denied_tx(
     binding: &BindingRow,
     replacement: &[u8; 32],
 ) -> Result<bool> {
+    // Replacement keys are community-global credentials. A retired or revoked
+    // key cannot become fresh merely by moving it to another principal.
     Ok(sqlx::query_scalar(
         "SELECT \
            EXISTS(SELECT 1 FROM identity_principals WHERE community_id=$1 \
@@ -1598,9 +1600,9 @@ async fn replacement_denied_tx(
            EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$4 \
                   AND binding_state='active' AND revoked_at IS NULL) OR \
            EXISTS(SELECT 1 FROM identity_retired_pairs WHERE community_id=$1 \
-                  AND issuer=$2 AND subject=$3 AND pubkey=$4) OR \
+                  AND pubkey=$4) OR \
            EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 \
-                  AND issuer=$2 AND uid=$3 AND pubkey=$4 AND revoked_at IS NOT NULL)",
+                  AND pubkey=$4 AND revoked_at IS NOT NULL)",
     )
     .bind(domain.as_uuid())
     .bind(&binding.issuer)

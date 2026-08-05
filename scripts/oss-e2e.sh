@@ -305,11 +305,11 @@ run_scenario() {
       cargo_test -p buzz-relay restart_bootstraps_full_state_before_readiness
       ;;
     O501)
-      cargo_test -p buzz-relay --test o5_operator_postgres
+      cargo_test -p buzz-relay --test o5_operator_postgres &&
       cargo_test -p buzz-db postgres_o5_outbox_rollback_delivery_restore_and_capacity_are_non_vacuous
       ;;
     P01)
-      cargo_test -p buzz-relay --test o5_operator_surface planted_canaries_never_cross_response_logs_or_metrics
+      cargo_test -p buzz-relay --test o5_operator_surface planted_canaries_never_cross_response_logs_or_metrics &&
       cargo_test -p buzz-db postgres_operator_lifecycle_is_atomic_idempotent_and_serialized
       ;;
     *)
