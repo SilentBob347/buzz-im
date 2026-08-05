@@ -168,8 +168,8 @@ pub fn goose_session_update(sid: &str, update: Value) -> Value {
 /// | `sessionUpdate` | `"usage_update"` | Discriminant |
 /// | `used` | `u64` | `input + output`; context-usage proxy |
 /// | `contextLimit` | `u64` | `0` — buzz-agent has no context limit tracking |
-/// | `accumulatedInputTokens` | `u64` | Session-cumulative inclusive input tokens |
-/// | `accumulatedOutputTokens` | `u64` | Session-cumulative output tokens |
+/// | `accumulatedInputTokens` | `u64?` | Session-cumulative inclusive input tokens; **absent** when overflow-poisoned |
+/// | `accumulatedOutputTokens` | `u64?` | Session-cumulative output tokens; **absent** when overflow-poisoned |
 /// | `accumulatedCachedInputTokens` | `u64?` | Session-cumulative cache-read tokens; **absent** when never observed (harness restart, goose, or first turn); `0` when provider confirmed no cache hits |
 /// | `accumulatedCacheWriteTokens` | `u64?` | Session-cumulative cache-write tokens; **absent** when never observed (same rules as cached-read) |
 /// | `accumulatedTotalTokens` | `u64?` | Session-cumulative provider total; absent unless every turn reported one |
@@ -180,6 +180,11 @@ pub fn goose_session_update(sid: &str, update: Value) -> Value {
 /// consumer that does not recognise these fields ignores them cleanly; a new
 /// consumer that receives them absent treats them as unknown, not zero.
 ///
+/// **Overflow poison**: `accumulatedInputTokens` and `accumulatedOutputTokens`
+/// are omitted (never `null`, never `u64::MAX`) when the session-cumulative sum
+/// has overflowed.  A consumer that receives them absent treats them as
+/// incomplete, consistent with the `accumulatedTotalTokens` contract.
+///
 /// **Monotonic within a session**: each notification carries a cumulative
 /// snapshot that can only increase. A consumer that takes the high-water mark
 /// always ends up at the final value.
@@ -189,8 +194,8 @@ pub fn goose_session_update(sid: &str, update: Value) -> Value {
 /// categories are tracked independently. Either can become absent (e.g. after
 /// a provider switch) without poisoning the other.
 pub fn usage_update_payload(
-    accumulated_input_tokens: u64,
-    accumulated_output_tokens: u64,
+    accumulated_input_tokens: Option<u64>,
+    accumulated_output_tokens: Option<u64>,
     accumulated_cached_input_tokens: Option<u64>,
     accumulated_cache_write_tokens: Option<u64>,
     accumulated_total: crate::types::TurnTotalState,
@@ -199,14 +204,21 @@ pub fn usage_update_payload(
 ) -> Value {
     let mut update = json!({
         "sessionUpdate": "usage_update",
-        // used: total tokens as a context-usage proxy;
+        // used: total tokens as a context-usage proxy; saturate when either
+        // side is absent or poisoned (display-only, ACP treats it as dead code).
         // contextLimit: 0 (buzz-agent has no context limit tracking).
-        "used": accumulated_input_tokens.saturating_add(accumulated_output_tokens),
+        "used": accumulated_input_tokens.unwrap_or(0).saturating_add(accumulated_output_tokens.unwrap_or(0)),
         "contextLimit": 0u64,
-        "accumulatedInputTokens": accumulated_input_tokens,
-        "accumulatedOutputTokens": accumulated_output_tokens,
         "model": model,
     });
+    // accumulatedInputTokens / accumulatedOutputTokens: omitted (never null,
+    // never u64::MAX) when the session-cumulative sum has overflowed.
+    if let Some(input) = accumulated_input_tokens {
+        update["accumulatedInputTokens"] = json!(input);
+    }
+    if let Some(output) = accumulated_output_tokens {
+        update["accumulatedOutputTokens"] = json!(output);
+    }
     // accumulatedCachedInputTokens: a subset of accumulatedInputTokens, not an
     // addition to it. Extends goose's usage_update shape; a consumer that does
     // not know the field ignores it and prices exactly as it did before.
@@ -394,8 +406,8 @@ mod tests {
     fn usage_update_payload_includes_pricing_identity_when_proven() {
         let pi = make_pi("api.anthropic.com", "claude-opus-4-5");
         let payload = usage_update_payload(
-            1000,
-            200,
+            Some(1000),
+            Some(200),
             None,
             None,
             crate::types::TurnTotalState::Unseen,
@@ -420,8 +432,8 @@ mod tests {
     #[test]
     fn usage_update_payload_omits_pricing_identity_when_absent() {
         let payload = usage_update_payload(
-            500,
-            100,
+            Some(500),
+            Some(100),
             None,
             None,
             crate::types::TurnTotalState::Unseen,
@@ -444,8 +456,8 @@ mod tests {
     fn usage_update_payload_no_pricing_identity_for_custom_endpoint() {
         // Custom endpoint → caller passes None (pricing_authority returned None).
         let payload = usage_update_payload(
-            800,
-            150,
+            Some(800),
+            Some(150),
             Some(200),
             None,
             crate::types::TurnTotalState::Unseen,
@@ -462,5 +474,64 @@ mod tests {
             payload["accumulatedCachedInputTokens"],
             serde_json::json!(200)
         );
+    }
+
+    /// When input is overflow-poisoned (None), the wire payload must omit
+    /// `accumulatedInputTokens` entirely — never null, never u64::MAX.
+    #[test]
+    fn usage_update_payload_omits_input_when_poisoned() {
+        let payload = usage_update_payload(
+            None, // overflow-poisoned
+            Some(150),
+            None,
+            None,
+            crate::types::TurnTotalState::Unseen,
+            "model",
+            None,
+        );
+        assert!(
+            payload.get("accumulatedInputTokens").is_none(),
+            "poisoned accumulatedInputTokens must be absent, not null or MAX"
+        );
+        // output still present
+        assert_eq!(payload["accumulatedOutputTokens"], serde_json::json!(150));
+    }
+
+    /// When output is overflow-poisoned (None), the wire payload must omit
+    /// `accumulatedOutputTokens` entirely — never null, never u64::MAX.
+    #[test]
+    fn usage_update_payload_omits_output_when_poisoned() {
+        let payload = usage_update_payload(
+            Some(800),
+            None, // overflow-poisoned
+            None,
+            None,
+            crate::types::TurnTotalState::Unseen,
+            "model",
+            None,
+        );
+        assert!(
+            payload.get("accumulatedOutputTokens").is_none(),
+            "poisoned accumulatedOutputTokens must be absent, not null or MAX"
+        );
+        // input still present
+        assert_eq!(payload["accumulatedInputTokens"], serde_json::json!(800));
+    }
+
+    /// When both are present and exact, the wire payload emits both at their
+    /// values (unchanged goose-compatible behavior).
+    #[test]
+    fn usage_update_payload_emits_both_when_exact() {
+        let payload = usage_update_payload(
+            Some(1000),
+            Some(200),
+            None,
+            None,
+            crate::types::TurnTotalState::Unseen,
+            "model",
+            None,
+        );
+        assert_eq!(payload["accumulatedInputTokens"], serde_json::json!(1000));
+        assert_eq!(payload["accumulatedOutputTokens"], serde_json::json!(200));
     }
 }

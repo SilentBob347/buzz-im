@@ -167,6 +167,14 @@ pub struct LlmResponse {
     /// tokens, so reading it alone would undercount). Used to gate handoff on
     /// the real token budget rather than a byte estimate.
     pub input_tokens: Option<u64>,
+    /// `true` when the Anthropic-style inclusive input sum (`input_tokens +
+    /// cache_read_input_tokens + cache_creation_input_tokens`) overflowed
+    /// `u64::MAX` during parsing. When set, `input_tokens` is `None` (the
+    /// clamped value is discarded) and the run loop must poison the input
+    /// `TurnIOState` and freeze the context-gate baseline rather than treating
+    /// the response as absent-usage.  Always `false` for OpenAI / Responses
+    /// API parsers, whose input field is a single scalar that cannot overflow.
+    pub input_tokens_overflowed: bool,
     /// The portion of `input_tokens` the provider served from its prompt cache,
     /// or `None` when the response reported no cache split. Providers bill this
     /// slice at a large discount (roughly 10x for both OpenAI and Anthropic),
@@ -408,6 +416,74 @@ impl TurnTotalState {
     }
 }
 
+/// Per-turn and per-session accumulator for input or output token counts.
+///
+/// Unlike [`CacheTotalState`] and [`TurnTotalState`], absence of a field on a
+/// usage-bearing response does NOT poison this accumulator — that behaviour was
+/// reviewed and explicitly cleared (absence means the provider did not report
+/// it, not that the value is unknown).  Only arithmetic overflow transitions
+/// the state to `Poisoned`.
+///
+/// States:
+/// - `Unseen`: no usage-bearing response has contributed a value yet (initial
+///   state for each turn / session).  Emitted as absent on the wire.
+/// - `Exact(n)`: every contributing response supplied a value; `n` is their
+///   sum.  Emitted as the value on the wire.
+/// - `Poisoned`: the running sum overflowed `u64::MAX` — permanently poisoned
+///   for this turn.  The session-cumulative also transitions to `Poisoned` when
+///   any turn lands `Poisoned`, and stays there until a new session resets it.
+///   Emitted as absent (the wire field is omitted, never `null`, never MAX).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnIOState {
+    #[default]
+    Unseen,
+    Exact(u64),
+    Poisoned,
+}
+
+impl TurnIOState {
+    /// Fold one provider-reported value into the current state.
+    ///
+    /// Called for each usage-bearing response that carries this category.
+    /// Absence (`None`) is handled by the caller; only present values reach
+    /// here.  Overflow → `Poisoned`.
+    pub fn fold_round(self, n: u64) -> TurnIOState {
+        match self {
+            TurnIOState::Poisoned => TurnIOState::Poisoned,
+            TurnIOState::Unseen => TurnIOState::Exact(n),
+            TurnIOState::Exact(acc) => match acc.checked_add(n) {
+                Some(sum) => TurnIOState::Exact(sum),
+                None => TurnIOState::Poisoned,
+            },
+        }
+    }
+
+    /// Merge a completed turn's state into the session-cumulative state.
+    ///
+    /// - `Unseen` turn (no provider response contributed) → cumulative unchanged.
+    /// - Either side `Poisoned` → session permanently poisoned.
+    /// - Two `Exact` values → summed with overflow check; overflow → `Poisoned`.
+    pub fn merge_session(self, turn: TurnIOState) -> TurnIOState {
+        match (self, turn) {
+            (TurnIOState::Poisoned, _) | (_, TurnIOState::Poisoned) => TurnIOState::Poisoned,
+            (acc, TurnIOState::Unseen) => acc,
+            (TurnIOState::Unseen, TurnIOState::Exact(n)) => TurnIOState::Exact(n),
+            (TurnIOState::Exact(acc), TurnIOState::Exact(n)) => match acc.checked_add(n) {
+                Some(sum) => TurnIOState::Exact(sum),
+                None => TurnIOState::Poisoned,
+            },
+        }
+    }
+
+    /// Return `Some(n)` only when `Exact`; `None` for `Unseen` or `Poisoned`.
+    pub fn exact_value(self) -> Option<u64> {
+        match self {
+            TurnIOState::Exact(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
 /// The session-cumulative usage counters as of the START of a turn.
 ///
 /// Copied out of the session under the lock when a turn begins and handed to
@@ -425,8 +501,8 @@ impl TurnTotalState {
 /// terminated mid-turn by design.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionUsageBaseline {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: TurnIOState,
+    pub output_tokens: TurnIOState,
     /// Tri-state for the cache-served subset of `input_tokens`.
     /// `Unseen` = never observed; `Exact(n)` = cumulative known; `Unknown` = poisoned.
     pub cached_input_tokens: CacheTotalState,
@@ -949,5 +1025,122 @@ mod cache_total_state_tests {
             CacheTotalState::Unknown,
             "overflow in merge_session() must produce Unknown, not Exact(u64::MAX)"
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_io_state_tests {
+    use super::*;
+
+    /// Folding a value into Unseen yields Exact.
+    #[test]
+    fn fold_round_unseen_becomes_exact() {
+        assert_eq!(TurnIOState::Unseen.fold_round(100), TurnIOState::Exact(100));
+    }
+
+    /// Folding a second value into Exact sums them.
+    #[test]
+    fn fold_round_exact_accumulates() {
+        assert_eq!(
+            TurnIOState::Exact(300).fold_round(200),
+            TurnIOState::Exact(500)
+        );
+    }
+
+    /// Overflow on fold_round → Poisoned, never u64::MAX.
+    #[test]
+    fn fold_round_overflow_within_turn_produces_poisoned_not_saturates() {
+        let near_max = u64::MAX - 10;
+        assert_eq!(
+            TurnIOState::Exact(near_max).fold_round(20),
+            TurnIOState::Poisoned,
+            "within-turn overflow must produce Poisoned, not Exact(u64::MAX)"
+        );
+    }
+
+    /// Poisoned stays Poisoned on further folds.
+    #[test]
+    fn fold_round_poisoned_stays_poisoned() {
+        assert_eq!(TurnIOState::Poisoned.fold_round(1), TurnIOState::Poisoned);
+    }
+
+    /// Two rounds each with ~u64::MAX/2 + 1 must poison.
+    #[test]
+    fn fold_round_two_large_values_poison() {
+        let half = u64::MAX / 2 + 1;
+        let state = TurnIOState::Unseen.fold_round(half).fold_round(half);
+        assert_eq!(
+            state,
+            TurnIOState::Poisoned,
+            "two rounds summing past u64::MAX must produce Poisoned"
+        );
+    }
+
+    /// Unseen turn leaves cumulative unchanged.
+    #[test]
+    fn merge_session_unseen_turn_leaves_cumulative_unchanged() {
+        assert_eq!(
+            TurnIOState::Exact(500).merge_session(TurnIOState::Unseen),
+            TurnIOState::Exact(500)
+        );
+    }
+
+    /// First exact turn from Unseen cumulative adopts the value.
+    #[test]
+    fn merge_session_first_exact_turn_from_unseen_adopts_value() {
+        assert_eq!(
+            TurnIOState::Unseen.merge_session(TurnIOState::Exact(200)),
+            TurnIOState::Exact(200)
+        );
+    }
+
+    /// Exact turn adds to exact cumulative.
+    #[test]
+    fn merge_session_exact_turn_adds_to_exact_cumulative() {
+        assert_eq!(
+            TurnIOState::Exact(1000).merge_session(TurnIOState::Exact(200)),
+            TurnIOState::Exact(1200)
+        );
+    }
+
+    /// Session-cumulative overflow → Poisoned permanently.
+    #[test]
+    fn merge_session_overflow_poisons_session_not_saturates() {
+        let near_max = u64::MAX - 100;
+        assert_eq!(
+            TurnIOState::Exact(near_max).merge_session(TurnIOState::Exact(200)),
+            TurnIOState::Poisoned,
+            "turn-to-session overflow must produce Poisoned, not Exact(u64::MAX)"
+        );
+    }
+
+    /// Poisoned cumulative stays Poisoned regardless of the turn.
+    #[test]
+    fn merge_session_poisoned_cumulative_stays_poisoned() {
+        assert_eq!(
+            TurnIOState::Poisoned.merge_session(TurnIOState::Exact(100)),
+            TurnIOState::Poisoned
+        );
+        assert_eq!(
+            TurnIOState::Poisoned.merge_session(TurnIOState::Unseen),
+            TurnIOState::Poisoned
+        );
+    }
+
+    /// A poisoned turn permanently poisons the session cumulative.
+    #[test]
+    fn merge_session_poisoned_turn_poisons_cumulative_permanently() {
+        assert_eq!(
+            TurnIOState::Exact(1000).merge_session(TurnIOState::Poisoned),
+            TurnIOState::Poisoned
+        );
+    }
+
+    /// exact_value returns Some only for Exact.
+    #[test]
+    fn exact_value_only_for_exact_variant() {
+        assert_eq!(TurnIOState::Exact(42).exact_value(), Some(42));
+        assert_eq!(TurnIOState::Unseen.exact_value(), None);
+        assert_eq!(TurnIOState::Poisoned.exact_value(), None);
     }
 }

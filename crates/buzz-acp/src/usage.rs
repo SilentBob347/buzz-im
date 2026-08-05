@@ -65,7 +65,7 @@ pub(crate) struct GooseSessionUpdateNotification {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub(crate) enum GooseSessionUpdateVariant {
-    UsageUpdate(UsageUpdatePayload),
+    UsageUpdate(Box<UsageUpdatePayload>),
     #[serde(other)]
     Other,
 }
@@ -83,8 +83,19 @@ pub(crate) struct UsageUpdatePayload {
     #[serde(default)]
     #[allow(dead_code)]
     pub context_limit: u64,
-    pub accumulated_input_tokens: u64,
-    pub accumulated_output_tokens: u64,
+    /// Session-cumulative inclusive input tokens.
+    ///
+    /// `None` when buzz-agent omitted the field — this happens when the
+    /// session-cumulative sum overflowed `u64::MAX`.  Goose always emits this
+    /// field, so `None` from goose is not expected; `#[serde(default)]` keeps
+    /// backward compatibility with any producer that omits it.
+    #[serde(default)]
+    pub accumulated_input_tokens: Option<u64>,
+    /// Session-cumulative output tokens.
+    ///
+    /// Same overflow-omit contract as `accumulated_input_tokens`.
+    #[serde(default)]
+    pub accumulated_output_tokens: Option<u64>,
     /// The cache-served subset of `accumulated_input_tokens`.
     ///
     /// `None` when the harness did not include the field (e.g. goose, which
@@ -138,9 +149,12 @@ struct SessionState {
     published_seq: u64,
     /// Cumulative input tokens at the end of the LAST PUBLISHED turn.
     /// Advanced only on publish (i.e. in `take()`), not on every notification.
-    last_input: u64,
+    /// `None` when the publisher omitted the field (overflow-poisoned) — any
+    /// subsequent snapshot will also be absent, so no delta is ever possible.
+    last_input: Option<u64>,
     /// Cumulative output tokens at the end of the LAST PUBLISHED turn.
-    last_output: u64,
+    /// Same overflow-absent contract as `last_input`.
+    last_output: Option<u64>,
     /// Cumulative cost at the end of the LAST PUBLISHED turn.
     last_cost: Option<f64>,
     /// Cumulative total tokens at the end of the LAST PUBLISHED turn.
@@ -194,9 +208,11 @@ pub struct TurnUsage {
     /// Field-local — same contract as `turn_cache_read_tokens`.
     pub turn_cache_write_tokens: Option<u64>,
     /// Session-cumulative input tokens as reported by goose at end of turn.
-    pub cumulative_input_tokens: u64,
+    /// `None` when the publisher omitted the field (overflow-poisoned session).
+    pub cumulative_input_tokens: Option<u64>,
     /// Session-cumulative output tokens as reported by goose at end of turn.
-    pub cumulative_output_tokens: u64,
+    /// `None` when the publisher omitted the field (overflow-poisoned session).
+    pub cumulative_output_tokens: Option<u64>,
     /// Session-cumulative genuine provider total tokens as reported by buzz-agent;
     /// `None` when the session has never emitted one or any turn lacked one.
     pub cumulative_total_tokens: Option<u64>,
@@ -325,29 +341,44 @@ impl UsageTracker {
                     // *published* seq — constant for all notifications in this
                     // turn, advanced only on publish.
                     let seq = prev.published_seq + 1;
-                    // Token counter decrease → unreliable delta.
-                    if current_input < prev.last_input || current_output < prev.last_output {
-                        (false, None, None, None, seq)
-                    } else {
-                        let di = current_input - prev.last_input;
-                        let dout = current_output - prev.last_output;
-                        // Cost delta: only when both snapshots have cost.
-                        // A cost *decrease* is also unreliable (NIP-AM: negative
-                        // delta ⇒ delta_reliable false, null all turn fields).
-                        let (dc, cost_reliable) = match (current_cost, prev.last_cost) {
-                            (Some(c), Some(p)) if c >= p => (Some(c - p), true),
-                            (Some(_), Some(_)) => {
-                                // Both present but current < prev — counter decreased.
-                                (None, false)
+                    // Absent input or output (publisher overflow-poisoned) →
+                    // unreliable delta; not advancing is correct since publisher
+                    // poison is permanent and subsequent snapshots will also be absent.
+                    match (
+                        current_input,
+                        current_output,
+                        prev.last_input,
+                        prev.last_output,
+                    ) {
+                        (Some(ci), Some(co), Some(pi), Some(po)) => {
+                            // Token counter decrease → unreliable delta.
+                            if ci < pi || co < po {
+                                (false, None, None, None, seq)
+                            } else {
+                                let di = ci - pi;
+                                let dout = co - po;
+                                // Cost delta: only when both snapshots have cost.
+                                // A cost *decrease* is also unreliable (NIP-AM: negative
+                                // delta ⇒ delta_reliable false, null all turn fields).
+                                let (dc, cost_reliable) = match (current_cost, prev.last_cost) {
+                                    (Some(c), Some(p)) if c >= p => (Some(c - p), true),
+                                    (Some(_), Some(_)) => {
+                                        // Both present but current < prev — counter decreased.
+                                        (None, false)
+                                    }
+                                    _ => (None, true), // absent on either side: null cost, reliable tokens
+                                };
+                                if cost_reliable {
+                                    (true, Some(di), Some(dout), dc, seq)
+                                } else {
+                                    // Cost decrease overrides the whole record to unreliable.
+                                    (false, None, None, None, seq)
+                                }
                             }
-                            _ => (None, true), // absent on either side: null cost, reliable tokens
-                        };
-                        if cost_reliable {
-                            (true, Some(di), Some(dout), dc, seq)
-                        } else {
-                            // Cost decrease overrides the whole record to unreliable.
-                            (false, None, None, None, seq)
                         }
+                        // One or both sides absent (publisher-poisoned or no prior baseline) →
+                        // unreliable. Not advancing is fine — publisher poison is permanent.
+                        _ => (false, None, None, None, seq),
                     }
                 }
             };
@@ -486,8 +517,8 @@ impl UsageTracker {
             .entry(session_id.to_string())
             .or_insert(SessionState {
                 published_seq: 0,
-                last_input: 0,
-                last_output: 0,
+                last_input: Some(0),
+                last_output: Some(0),
                 last_cost: Some(0.0),
                 // At spawn all counters are zero — seed known-zero baselines so
                 // the first real turn delta is computed exactly, not discarded as
@@ -552,7 +583,7 @@ mod tests {
         }))
         .expect("payload must deserialize");
         assert_eq!(p.accumulated_cached_input_tokens, Some(5_033));
-        assert!(p.accumulated_cached_input_tokens.unwrap() <= p.accumulated_input_tokens);
+        assert!(p.accumulated_cached_input_tokens.unwrap() <= p.accumulated_input_tokens.unwrap());
     }
 
     /// goose does not send the field; its payloads must deserialize with None —
@@ -594,8 +625,8 @@ mod tests {
         UsageUpdatePayload {
             used: input + output,
             context_limit: 200_000,
-            accumulated_input_tokens: input,
-            accumulated_output_tokens: output,
+            accumulated_input_tokens: Some(input),
+            accumulated_output_tokens: Some(output),
             accumulated_cached_input_tokens: None,
             accumulated_cache_write_tokens: None,
             accumulated_cost: cost,
@@ -609,8 +640,8 @@ mod tests {
         UsageUpdatePayload {
             used: 0,
             context_limit: 0,
-            accumulated_input_tokens: input,
-            accumulated_output_tokens: output,
+            accumulated_input_tokens: Some(input),
+            accumulated_output_tokens: Some(output),
             accumulated_cached_input_tokens: None,
             accumulated_cache_write_tokens: None,
             accumulated_cost: cost,
@@ -693,7 +724,7 @@ mod tests {
         let a1 = tracker.take().expect("A turn 1");
         assert_eq!(a1.turn_seq, 1);
         assert!(!a1.delta_reliable, "first turn is unreliable");
-        assert_eq!(a1.cumulative_input_tokens, 1000);
+        assert_eq!(a1.cumulative_input_tokens, Some(1000));
 
         // ── B is now in-flight; A late notification arrives ──
         tracker.begin_turn("sess-b");
@@ -726,8 +757,8 @@ mod tests {
              late cross-session advance (500)"
         );
         assert_eq!(a2.turn_output_tokens, Some(150));
-        assert_eq!(a2.cumulative_input_tokens, 2000);
-        assert_eq!(a2.cumulative_output_tokens, 250);
+        assert_eq!(a2.cumulative_input_tokens, Some(2000));
+        assert_eq!(a2.cumulative_output_tokens, Some(250));
     }
 
     // ── Delta computation: non-happy paths ─────────────────────────────────
@@ -749,8 +780,8 @@ mod tests {
         assert!(usage.turn_output_tokens.is_none());
         assert!(usage.turn_cost_usd.is_none());
         // Cumulative is still populated.
-        assert_eq!(usage.cumulative_input_tokens, 1000);
-        assert_eq!(usage.cumulative_output_tokens, 200);
+        assert_eq!(usage.cumulative_input_tokens, Some(1000));
+        assert_eq!(usage.cumulative_output_tokens, Some(200));
         assert_eq!(usage.cumulative_cost_usd, Some(0.01));
     }
 
@@ -806,8 +837,8 @@ mod tests {
         assert!(usage.turn_output_tokens.is_none());
         assert!(usage.turn_cost_usd.is_none());
         // Cumulative values are unaffected.
-        assert_eq!(usage.cumulative_input_tokens, 1500);
-        assert_eq!(usage.cumulative_output_tokens, 350);
+        assert_eq!(usage.cumulative_input_tokens, Some(1500));
+        assert_eq!(usage.cumulative_output_tokens, Some(350));
         assert_eq!(usage.cumulative_cost_usd, Some(0.05));
     }
 
@@ -878,8 +909,8 @@ mod tests {
         // cost delta: 0.018 - 0.01 = 0.008 (floating-point; use approx check)
         let dc = usage.turn_cost_usd.expect("cost delta present");
         assert!((dc - 0.008).abs() < 1e-9, "cost delta: {dc}");
-        assert_eq!(usage.cumulative_input_tokens, 1800);
-        assert_eq!(usage.cumulative_output_tokens, 450);
+        assert_eq!(usage.cumulative_input_tokens, Some(1800));
+        assert_eq!(usage.cumulative_output_tokens, Some(450));
     }
 
     #[test]
@@ -916,8 +947,8 @@ mod tests {
         let usage = tracker.take().expect("turn 2");
 
         // Cumulative from the last notification.
-        assert_eq!(usage.cumulative_input_tokens, 2000);
-        assert_eq!(usage.cumulative_output_tokens, 250);
+        assert_eq!(usage.cumulative_input_tokens, Some(2000));
+        assert_eq!(usage.cumulative_output_tokens, Some(250));
         // Delta is from committed baseline (1000, 100) → (2000, 250) = 1000/150.
         assert_eq!(usage.turn_input_tokens, Some(1000));
         assert_eq!(usage.turn_output_tokens, Some(150));
@@ -954,8 +985,8 @@ mod tests {
         assert_eq!(notif.session_id, "abc-123");
         match notif.update {
             GooseSessionUpdateVariant::UsageUpdate(p) => {
-                assert_eq!(p.accumulated_input_tokens, 40000);
-                assert_eq!(p.accumulated_output_tokens, 10000);
+                assert_eq!(p.accumulated_input_tokens, Some(40000));
+                assert_eq!(p.accumulated_output_tokens, Some(10000));
                 assert_eq!(p.accumulated_cost, Some(0.42));
             }
             GooseSessionUpdateVariant::Other => panic!("expected UsageUpdate"),
@@ -977,8 +1008,8 @@ mod tests {
             serde_json::from_value(raw).expect("deserialization");
         match notif.update {
             GooseSessionUpdateVariant::UsageUpdate(p) => {
-                assert_eq!(p.accumulated_input_tokens, 500);
-                assert_eq!(p.accumulated_output_tokens, 100);
+                assert_eq!(p.accumulated_input_tokens, Some(500));
+                assert_eq!(p.accumulated_output_tokens, Some(100));
                 assert_eq!(p.used, 0);
                 assert_eq!(p.context_limit, 0);
                 assert!(p.accumulated_cost.is_none());
@@ -1054,7 +1085,7 @@ mod tests {
         }
         let t1 = tracker.take().expect("turn 1");
         assert!(!t1.delta_reliable, "first turn: unreliable");
-        assert_eq!(t1.cumulative_input_tokens, 300);
+        assert_eq!(t1.cumulative_input_tokens, Some(300));
 
         // Turn 2 — delta reliable.
         tracker.begin_turn("buzz-s1");
@@ -1109,8 +1140,8 @@ mod tests {
         UsageUpdatePayload {
             used: input + output,
             context_limit: 200_000,
-            accumulated_input_tokens: input,
-            accumulated_output_tokens: output,
+            accumulated_input_tokens: Some(input),
+            accumulated_output_tokens: Some(output),
             accumulated_cached_input_tokens: None,
             accumulated_cache_write_tokens: None,
             accumulated_cost: cost,
@@ -1175,8 +1206,8 @@ mod tests {
         UsageUpdatePayload {
             used: input + output,
             context_limit: 200_000,
-            accumulated_input_tokens: input,
-            accumulated_output_tokens: output,
+            accumulated_input_tokens: Some(input),
+            accumulated_output_tokens: Some(output),
             accumulated_cached_input_tokens: None,
             accumulated_cache_write_tokens: None,
             accumulated_cost: None,
@@ -1345,8 +1376,8 @@ mod tests {
         UsageUpdatePayload {
             used: input + output,
             context_limit: 200_000,
-            accumulated_input_tokens: input,
-            accumulated_output_tokens: output,
+            accumulated_input_tokens: Some(input),
+            accumulated_output_tokens: Some(output),
             accumulated_cached_input_tokens: cached_input,
             accumulated_cache_write_tokens: None,
             accumulated_cost: None,
@@ -1591,8 +1622,8 @@ mod tests {
             turn_cost_usd: None,
             turn_cache_read_tokens: None,
             turn_cache_write_tokens: None,
-            cumulative_input_tokens: 700,
-            cumulative_output_tokens: 200,
+            cumulative_input_tokens: Some(700),
+            cumulative_output_tokens: Some(200),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
             cumulative_cache_read_tokens: None, // harness did not report the field
@@ -1632,8 +1663,8 @@ mod tests {
             turn_cost_usd: None,
             turn_cache_read_tokens: Some(300),
             turn_cache_write_tokens: None,
-            cumulative_input_tokens: 700,
-            cumulative_output_tokens: 200,
+            cumulative_input_tokens: Some(700),
+            cumulative_output_tokens: Some(200),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
             cumulative_cache_read_tokens: Some(600),
@@ -1683,8 +1714,8 @@ mod tests {
         assert_eq!(usage.turn_output_tokens, Some(200));
         let dc = usage.turn_cost_usd.expect("cost delta present");
         assert!((dc - 0.01).abs() < 1e-9, "cost delta: {dc}");
-        assert_eq!(usage.cumulative_input_tokens, 1000);
-        assert_eq!(usage.cumulative_output_tokens, 200);
+        assert_eq!(usage.cumulative_input_tokens, Some(1000));
+        assert_eq!(usage.cumulative_output_tokens, Some(200));
     }
 
     /// (b) Re-attach session (no seed): first notification must remain
@@ -1710,8 +1741,8 @@ mod tests {
         assert!(usage.turn_output_tokens.is_none());
         assert!(usage.turn_cost_usd.is_none());
         // Cumulative still passes through.
-        assert_eq!(usage.cumulative_input_tokens, 5000);
-        assert_eq!(usage.cumulative_output_tokens, 1000);
+        assert_eq!(usage.cumulative_input_tokens, Some(5000));
+        assert_eq!(usage.cumulative_output_tokens, Some(1000));
     }
 
     /// (c) Second turn and beyond are unaffected in both modes.
@@ -1760,8 +1791,8 @@ mod tests {
             &UsageUpdatePayload {
                 used: 12345,
                 context_limit: 200_000,
-                accumulated_input_tokens: 10000,
-                accumulated_output_tokens: 2345,
+                accumulated_input_tokens: Some(10000),
+                accumulated_output_tokens: Some(2345),
                 accumulated_cached_input_tokens: Some(500),
                 accumulated_cache_write_tokens: None,
                 accumulated_cost: Some(0.042),
@@ -1788,8 +1819,8 @@ mod tests {
         );
         let dc = usage.turn_cost_usd.expect("cost delta present");
         assert!((dc - 0.042).abs() < 1e-9, "cost delta: {dc}");
-        assert_eq!(usage.cumulative_input_tokens, 10000);
-        assert_eq!(usage.cumulative_output_tokens, 2345);
+        assert_eq!(usage.cumulative_input_tokens, Some(10000));
+        assert_eq!(usage.cumulative_output_tokens, Some(2345));
         assert_eq!(usage.cumulative_total_tokens, Some(12345));
         assert_eq!(usage.cumulative_cost_usd, Some(0.042));
         assert_eq!(usage.model.as_deref(), Some("claude-opus-4-5"));
@@ -1846,8 +1877,8 @@ mod tests {
         UsageUpdatePayload {
             used: input + output,
             context_limit: 200_000,
-            accumulated_input_tokens: input,
-            accumulated_output_tokens: output,
+            accumulated_input_tokens: Some(input),
+            accumulated_output_tokens: Some(output),
             accumulated_cached_input_tokens: None,
             accumulated_cache_write_tokens: None,
             accumulated_cost: None,
@@ -2009,8 +2040,8 @@ mod tests {
         let payload = UsageUpdatePayload {
             used: 1200,
             context_limit: 200_000,
-            accumulated_input_tokens: 1000,
-            accumulated_output_tokens: 200,
+            accumulated_input_tokens: Some(1000),
+            accumulated_output_tokens: Some(200),
             accumulated_cached_input_tokens: Some(500),
             accumulated_cache_write_tokens: Some(120),
             accumulated_cost: None,
@@ -2146,6 +2177,170 @@ mod tests {
         assert!(
             usage.pricing_identity.is_none(),
             "A→absent→A in one turn: pricing_identity must remain absent (no healing after poison)"
+        );
+    }
+
+    // ── Overflow-poison ACP consumer tests ───────────────────────────────────
+
+    /// A payload with absent `accumulatedInputTokens` (publisher overflow-poisoned)
+    /// must produce `delta_reliable: false`, null turn fields, and null cumulative
+    /// input/output in `TurnUsage`.
+    #[test]
+    fn absent_input_tokens_produces_unreliable_delta_and_null_cumulative() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-poison-in");
+        tracker.begin_turn("sess-poison-in");
+
+        // Publisher omitted accumulatedInputTokens (overflow-poisoned).
+        let p = UsageUpdatePayload {
+            used: 0,
+            context_limit: 0,
+            accumulated_input_tokens: None, // overflow-poisoned
+            accumulated_output_tokens: Some(200),
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        };
+        tracker.record("sess-poison-in", &p);
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            !usage.delta_reliable,
+            "absent input: delta_reliable must be false"
+        );
+        assert!(
+            usage.turn_input_tokens.is_none(),
+            "absent input: turn_input_tokens must be None"
+        );
+        assert!(
+            usage.turn_output_tokens.is_none(),
+            "absent input: turn_output_tokens must be None"
+        );
+        assert!(
+            usage.cumulative_input_tokens.is_none(),
+            "absent input: cumulative_input_tokens must be None"
+        );
+        // cumulative_output_tokens passes through as-is (it's separate).
+        assert_eq!(usage.cumulative_output_tokens, Some(200));
+    }
+
+    /// A payload with absent `accumulatedOutputTokens` (publisher overflow-poisoned)
+    /// must produce `delta_reliable: false`, null turn fields, and null cumulative output.
+    #[test]
+    fn absent_output_tokens_produces_unreliable_delta_and_null_cumulative() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-poison-out");
+        tracker.begin_turn("sess-poison-out");
+
+        let p = UsageUpdatePayload {
+            used: 0,
+            context_limit: 0,
+            accumulated_input_tokens: Some(1000),
+            accumulated_output_tokens: None, // overflow-poisoned
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        };
+        tracker.record("sess-poison-out", &p);
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            !usage.delta_reliable,
+            "absent output: delta_reliable must be false"
+        );
+        assert!(usage.turn_input_tokens.is_none());
+        assert!(usage.turn_output_tokens.is_none());
+        assert_eq!(usage.cumulative_input_tokens, Some(1000));
+        assert!(
+            usage.cumulative_output_tokens.is_none(),
+            "absent output: cumulative_output_tokens must be None"
+        );
+    }
+
+    /// A goose-shaped payload with both input and output present must produce
+    /// the same behavior as before — delta_reliable true on seeded sessions,
+    /// cumulative values passed through exactly.
+    #[test]
+    fn goose_shaped_payload_both_present_unchanged_behavior() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-goose");
+        tracker.begin_turn("sess-goose");
+
+        tracker.record("sess-goose", &payload(1500, 300, None));
+        let usage = tracker.take().expect("pending");
+
+        assert!(
+            usage.delta_reliable,
+            "goose payload: delta_reliable must be true"
+        );
+        assert_eq!(usage.turn_input_tokens, Some(1500));
+        assert_eq!(usage.turn_output_tokens, Some(300));
+        assert_eq!(usage.cumulative_input_tokens, Some(1500));
+        assert_eq!(usage.cumulative_output_tokens, Some(300));
+    }
+
+    /// Once a session emits a poisoned snapshot (absent fields), subsequent turns
+    /// stay unknown — not advancing is correct since publisher poison is permanent.
+    #[test]
+    fn poison_mid_session_subsequent_turns_stay_unknown() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-poison-mid");
+
+        // Turn 1: normal.
+        tracker.begin_turn("sess-poison-mid");
+        tracker.record("sess-poison-mid", &payload(1000, 200, None));
+        let t1 = tracker.take().expect("t1");
+        assert!(t1.delta_reliable);
+        assert_eq!(t1.cumulative_input_tokens, Some(1000));
+
+        // Turn 2: overflow-poisoned (publisher omits input).
+        tracker.begin_turn("sess-poison-mid");
+        let poisoned = UsageUpdatePayload {
+            used: 0,
+            context_limit: 0,
+            accumulated_input_tokens: None,
+            accumulated_output_tokens: Some(500),
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        };
+        tracker.record("sess-poison-mid", &poisoned);
+        let t2 = tracker.take().expect("t2");
+        assert!(!t2.delta_reliable, "poisoned turn: delta_reliable false");
+        assert!(t2.cumulative_input_tokens.is_none());
+
+        // Turn 3: subsequent snapshot also absent → still unreliable.
+        tracker.begin_turn("sess-poison-mid");
+        let also_poisoned = UsageUpdatePayload {
+            used: 0,
+            context_limit: 0,
+            accumulated_input_tokens: None,
+            accumulated_output_tokens: Some(700),
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        };
+        tracker.record("sess-poison-mid", &also_poisoned);
+        let t3 = tracker.take().expect("t3");
+        assert!(
+            !t3.delta_reliable,
+            "turn after poison: delta_reliable still false"
+        );
+        assert!(
+            t3.cumulative_input_tokens.is_none(),
+            "turn after poison: cumulative_input_tokens stays None"
         );
     }
 }

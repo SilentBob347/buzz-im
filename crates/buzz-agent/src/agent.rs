@@ -16,7 +16,8 @@ use crate::mcp::ResultBudget;
 
 use crate::types::{
     AgentError, CacheTotalState, ContentBlock, HistoryItem, PricingIdentity, ProviderStop,
-    SessionUsageBaseline, StopReason, ToolCall, ToolResult, ToolResultContent, TurnTotalState,
+    SessionUsageBaseline, StopReason, ToolCall, ToolResult, ToolResultContent, TurnIOState,
+    TurnTotalState,
 };
 use crate::wire::{self, WireSender};
 
@@ -159,11 +160,11 @@ pub struct RunCtx<'a> {
     /// preserved in lockstep with `last_request_input_tokens`.
     pub last_request_history_bytes: &'a mut Option<usize>,
     /// Accumulated input tokens across all LLM rounds in this turn, for
-    /// NIP-AM metric publishing. Reset to `None` at turn start in `run()`.
-    pub turn_input_tokens: &'a mut Option<u64>,
+    /// NIP-AM metric publishing. Reset to `Unseen` at turn start in `run()`.
+    pub turn_input_tokens: &'a mut TurnIOState,
     /// Accumulated output tokens across all LLM rounds in this turn, for
-    /// NIP-AM metric publishing. Reset to `None` at turn start in `run()`.
-    pub turn_output_tokens: &'a mut Option<u64>,
+    /// NIP-AM metric publishing. Reset to `Unseen` at turn start in `run()`.
+    pub turn_output_tokens: &'a mut TurnIOState,
     /// The cache-served subset of `turn_input_tokens`, accumulated across all
     /// LLM rounds in this turn. Reset to `Unseen` at turn start in `run()`.
     /// Consumers price this slice at the provider's cached rate; without it
@@ -265,9 +266,11 @@ impl RunCtx<'_> {
             .merge_session(*self.turn_cache_write_tokens);
         let payload = wire::usage_update_payload(
             base.input_tokens
-                .saturating_add(self.turn_input_tokens.unwrap_or(0)),
+                .merge_session(*self.turn_input_tokens)
+                .exact_value(),
             base.output_tokens
-                .saturating_add(self.turn_output_tokens.unwrap_or(0)),
+                .merge_session(*self.turn_output_tokens)
+                .exact_value(),
             cached_total.exact_value(),
             write_total.exact_value(),
             base.total_state.merge_session(*self.turn_total_state),
@@ -297,8 +300,8 @@ impl RunCtx<'_> {
         self.history.push(HistoryItem::User(user_text));
 
         // Reset per-turn token accumulators for this prompt.
-        *self.turn_input_tokens = None;
-        *self.turn_output_tokens = None;
+        *self.turn_input_tokens = TurnIOState::Unseen;
+        *self.turn_output_tokens = TurnIOState::Unseen;
         *self.turn_cached_input_tokens = CacheTotalState::Unseen;
         *self.turn_cache_write_tokens = CacheTotalState::Unseen;
         *self.turn_pricing_identity = None;
@@ -474,7 +477,17 @@ impl RunCtx<'_> {
             // a response omits usage (`None`) rather than clobbering — a
             // one-off missing field shouldn't blind the gate or zero the
             // growth baseline.
-            if let Some(tokens) = response.input_tokens {
+            if response.input_tokens_overflowed {
+                // The Anthropic-style inclusive sum (input_tokens +
+                // cache_read_input_tokens + cache_creation_input_tokens)
+                // overflowed u64::MAX during parsing. Permanently poison the
+                // turn accumulator so wire emission omits this value and ACP
+                // marks the delta unreliable. Do NOT update
+                // last_request_input_tokens — freeze the context-gate
+                // baseline at its prior reading rather than poisoning it with
+                // a clamped value, exactly as the absent-usage path does.
+                *self.turn_input_tokens = TurnIOState::Poisoned;
+            } else if let Some(tokens) = response.input_tokens {
                 *self.last_request_input_tokens = Some(tokens);
                 *self.last_request_history_bytes = Some(
                     self.history
@@ -483,19 +496,23 @@ impl RunCtx<'_> {
                         .sum(),
                 );
                 // Accumulate per-turn input tokens for NIP-AM metric publishing.
-                *self.turn_input_tokens =
-                    Some(self.turn_input_tokens.unwrap_or(0).saturating_add(tokens));
+                // fold_round uses checked_add; overflow permanently poisons the
+                // turn accumulator (and, via merge_session, the session cumulative).
+                *self.turn_input_tokens = self.turn_input_tokens.fold_round(tokens);
             }
             // Accumulate per-turn output tokens for NIP-AM metric publishing.
             if let Some(out) = response.output_tokens {
-                *self.turn_output_tokens =
-                    Some(self.turn_output_tokens.unwrap_or(0).saturating_add(out));
+                *self.turn_output_tokens = self.turn_output_tokens.fold_round(out);
             }
             // Fold the provider-reported total, cache subsets, and billing
             // identity — only when this response was usage-bearing (had input
             // or output tokens).  A response with no usage at all is not
             // evidence of a missing cache field or total and must not poison
             // either accumulator.
+            //
+            // `input_tokens_overflowed` counts as usage-bearing: the provider
+            // reported an input total (which overflowed) so cache fields and
+            // the total are meaningful and must be folded.
             //
             // D1: absent cache field on a usage-bearing round permanently
             // poisons the turn accumulator.  Some(0) stays Exact(0) (explicit
@@ -510,7 +527,10 @@ impl RunCtx<'_> {
             // with neither category is therefore not a supported shape and would
             // be silently ignored here. If that shape is ever encountered, extend
             // this gate rather than representing absent categories as zero.
-            if response.input_tokens.is_some() || response.output_tokens.is_some() {
+            if response.input_tokens.is_some()
+                || response.input_tokens_overflowed
+                || response.output_tokens.is_some()
+            {
                 *self.turn_total_state = self.turn_total_state.fold(response.total_tokens);
                 // Cache-read: the cache-served subset of input tokens.
                 *self.turn_cached_input_tokens = self

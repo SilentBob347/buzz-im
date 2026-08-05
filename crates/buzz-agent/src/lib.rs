@@ -97,9 +97,12 @@ struct Session {
     /// Session-cumulative input tokens across all turns. Sent in the
     /// `_goose/unstable/session/update` usage notification so buzz-acp's
     /// `UsageTracker` can compute per-turn deltas symmetrically with goose.
-    accumulated_input_tokens: u64,
+    /// `TurnIOState`: `Unseen` before any turn reports; `Exact(n)` while running;
+    /// `Poisoned` if any turn's sum overflowed — permanently poisons the session.
+    accumulated_input_tokens: crate::types::TurnIOState,
     /// Session-cumulative output tokens across all turns.
-    accumulated_output_tokens: u64,
+    /// Same `Unseen`/`Exact(n)`/`Poisoned` contract as `accumulated_input_tokens`.
+    accumulated_output_tokens: crate::types::TurnIOState,
     /// Session-cumulative cache-served input tokens across all turns — a subset
     /// of `accumulated_input_tokens`, not an addition to it. Tri-state:
     ///
@@ -486,8 +489,8 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             last_request_history_bytes: None,
             effective_system_prompt,
             effective_model: None,
-            accumulated_input_tokens: 0,
-            accumulated_output_tokens: 0,
+            accumulated_input_tokens: crate::types::TurnIOState::Unseen,
+            accumulated_output_tokens: crate::types::TurnIOState::Unseen,
             accumulated_cached_input_tokens: crate::types::CacheTotalState::Unseen,
             accumulated_cache_write_tokens: crate::types::CacheTotalState::Unseen,
             accumulated_total_state: crate::types::TurnTotalState::Unseen,
@@ -706,8 +709,8 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
     let effective_model_str = effective_model_override
         .as_deref()
         .unwrap_or(&app.cfg.model);
-    let mut turn_input_tokens: Option<u64> = None;
-    let mut turn_output_tokens: Option<u64> = None;
+    let mut turn_input_tokens: crate::types::TurnIOState = crate::types::TurnIOState::Unseen;
+    let mut turn_output_tokens: crate::types::TurnIOState = crate::types::TurnIOState::Unseen;
     let mut turn_cached_input_tokens: crate::types::CacheTotalState =
         crate::types::CacheTotalState::Unseen;
     let mut turn_cache_write_tokens: crate::types::CacheTotalState =
@@ -765,16 +768,19 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
     // Only emit when at least one token count was observed — a turn with no
     // provider response (validation failure, pre-response cancellation) carries
     // no information and must not produce a kind 44200 record per NIP-AM.
-    if turn_input_tokens.is_some() || turn_output_tokens.is_some() {
+    if !matches!(turn_input_tokens, crate::types::TurnIOState::Unseen)
+        || !matches!(turn_output_tokens, crate::types::TurnIOState::Unseen)
+    {
         let accumulated = {
             let mut sessions = app.sessions.lock().await;
             if let Some(s) = sessions.get_mut(&sid) {
-                s.accumulated_input_tokens = s
-                    .accumulated_input_tokens
-                    .saturating_add(turn_input_tokens.unwrap_or(0));
+                // merge_session: Poisoned poisons permanently; Exact sums with
+                // overflow-check → Poisoned on wrap; Unseen leaves unchanged.
+                s.accumulated_input_tokens =
+                    s.accumulated_input_tokens.merge_session(turn_input_tokens);
                 s.accumulated_output_tokens = s
                     .accumulated_output_tokens
-                    .saturating_add(turn_output_tokens.unwrap_or(0));
+                    .merge_session(turn_output_tokens);
                 // D1 tri-state merge: merge_session propagates Unknown when
                 // the turn was poisoned (any usage-bearing round omitted the
                 // category), and is a no-op when the turn was Unseen (no
@@ -817,8 +823,8 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
             // final notification is shape-identical to the ones that preceded
             // it and a consumer taking the high-water mark lands on this one.
             let update = wire::usage_update_payload(
-                accumulated_in,
-                accumulated_out,
+                accumulated_in.exact_value(),
+                accumulated_out.exact_value(),
                 accumulated_cached.exact_value(),
                 accumulated_written.exact_value(),
                 accumulated_total,
