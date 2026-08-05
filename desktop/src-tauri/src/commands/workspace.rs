@@ -133,9 +133,9 @@ pub async fn apply_workspace(
 ) -> Result<(), String> {
     let restore_app = app.clone();
     app.state::<crate::native_websocket::WebSocketManager>()
-        .invalidate_projection()
+        .begin_scope_mutation()
         .await;
-    tokio::task::spawn_blocking(move || {
+    let mutation_result = tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
 
         // ── Validate before mutating ──────────────────────────────────────────
@@ -212,13 +212,15 @@ pub async fn apply_workspace(
         Ok::<(), String>(())
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))??;
+    .map_err(|e| format!("spawn_blocking failed: {e}"))
+    .and_then(|result| result);
 
-    // Fence work that raced the mutation after the pre-mutation invalidation.
+    // Always exit the fence, including closure errors and blocking-task panics.
     restore_app
         .state::<crate::native_websocket::WebSocketManager>()
-        .invalidate_projection()
+        .finish_scope_mutation()
         .await;
+    mutation_result?;
 
     let state = restore_app.state::<AppState>();
     // Backfill this exact relay+owner scope only after the workspace has been

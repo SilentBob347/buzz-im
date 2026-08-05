@@ -15,6 +15,9 @@ const KIND_REGISTRY: &str = include_str!("../../buzz-core/src/kind.rs");
 const INGEST_HANDLER: &str = include_str!("../src/handlers/ingest.rs");
 const READ_ONLY_RELAY_CLIENT: &str =
     include_str!("../../../desktop/src/shared/api/readOnlyRelayClient.ts");
+const WORKSPACE_COMMAND: &str =
+    include_str!("../../../desktop/src-tauri/src/commands/workspace.rs");
+const IDENTITY_COMMAND: &str = include_str!("../../../desktop/src-tauri/src/commands/identity.rs");
 
 #[test]
 fn mandatory_o4_security_contracts_are_present() {
@@ -388,6 +391,46 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
     assert!(nip11.contains("with_conformant_federated_identity"));
     assert!(router.contains("nip11_document(&state, raw_host).await"));
     assert!(!status.contains("std::env"));
+}
+
+#[test]
+fn scope_mutations_finalize_the_status_fence_before_propagating_failure() {
+    let workspace = WORKSPACE_COMMAND
+        .split("pub async fn apply_workspace")
+        .nth(1)
+        .and_then(|suffix| suffix.split("#[tauri::command]").next())
+        .expect("workspace command body exists");
+    let identity = IDENTITY_COMMAND
+        .split("pub async fn import_identity")
+        .nth(1)
+        .and_then(|suffix| suffix.split("/// Commit an imported identity").next())
+        .expect("identity command body exists");
+
+    for (name, command, result_propagation) in [
+        ("workspace", workspace, "mutation_result?"),
+        ("identity", identity, "let identity = identity_result?"),
+    ] {
+        let begin = command
+            .find(".begin_scope_mutation()")
+            .unwrap_or_else(|| panic!("{name} must enter the status mutation fence"));
+        let blocking = command
+            .find("spawn_blocking")
+            .unwrap_or_else(|| panic!("{name} blocking mutation exists"));
+        let finish = command
+            .find(".finish_scope_mutation()")
+            .unwrap_or_else(|| panic!("{name} must exit the status mutation fence"));
+        let propagate = command
+            .find(result_propagation)
+            .unwrap_or_else(|| panic!("{name} must propagate its stored result"));
+        assert!(
+            begin < blocking && blocking < finish && finish < propagate,
+            "{name} must finalize the status fence on success, error, or join failure"
+        );
+        assert!(
+            !command.contains(".invalidate_projection()"),
+            "{name} must not leave a reconnect gap between independent invalidations"
+        );
+    }
 }
 
 #[test]

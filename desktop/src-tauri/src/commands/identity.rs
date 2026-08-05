@@ -343,9 +343,9 @@ pub async fn import_identity(
     let projection_app = app_handle.clone();
     projection_app
         .state::<crate::native_websocket::WebSocketManager>()
-        .invalidate_projection()
+        .begin_scope_mutation()
         .await;
-    let identity = tokio::task::spawn_blocking(move || {
+    let identity_result = tokio::task::spawn_blocking(move || {
         // NIP-49 backups require a passphrase and decrypt entirely in Rust.
         // Raw nsec/hex input follows the existing parser path unchanged.
         let password = password.map(zeroize::Zeroizing::new);
@@ -391,11 +391,13 @@ pub async fn import_identity(
         })
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))??;
+    .map_err(|e| format!("spawn_blocking failed: {e}"))
+    .and_then(|result| result);
     projection_app
         .state::<crate::native_websocket::WebSocketManager>()
-        .invalidate_projection()
+        .finish_scope_mutation()
         .await;
+    let identity = identity_result?;
     Ok(identity)
 }
 
