@@ -4,45 +4,6 @@
 -- invalidation, publication transition, or audio-admission transition from
 -- the independent restore witness.
 
-ALTER TABLE audio_session_admissions
-    ADD COLUMN claimant_id UUID,
-    ADD COLUMN attachment_generation BIGINT NOT NULL DEFAULT 0
-        CHECK (attachment_generation >= 0),
-    ADD COLUMN claim_expires_at TIMESTAMPTZ;
-
--- A pre-cutover process-local attachment cannot be reconstructed safely. End
--- every nonterminal attempt fail-closed, while assigning a stable migration
--- claimant only to already-terminal history so the new invariant is additive
--- on populated databases.
-UPDATE audio_session_admissions
-SET state = 'aborted',
-    state_version = state_version + 1,
-    aborted_at = COALESCE(aborted_at, clock_timestamp()),
-    updated_at = clock_timestamp(),
-    failure_code = 'upgrade_reconciliation'
-WHERE state IN ('reserved', 'active');
-
-UPDATE audio_session_admissions
-SET claimant_id = admission_id,
-    attachment_generation = 1,
-    claim_expires_at = lease_expires_at
-WHERE state = 'finished';
-
-ALTER TABLE audio_session_admissions
-    ADD CONSTRAINT audio_session_admissions_claim CHECK (
-        (state = 'reserved'
-            AND claimant_id IS NOT NULL
-            AND attachment_generation = 0
-            AND claim_expires_at IS NOT NULL)
-        OR
-        (state IN ('active', 'finished')
-            AND claimant_id IS NOT NULL
-            AND attachment_generation > 0
-            AND claim_expires_at IS NOT NULL)
-        OR
-        (state = 'aborted')
-    );
-
 CREATE TABLE authorization_authority_epochs (
     community_id UUID NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
     authority_epoch BIGINT NOT NULL DEFAULT 1 CHECK (authority_epoch > 0),
