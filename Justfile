@@ -301,7 +301,7 @@ ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri
 test:
     ./scripts/run-tests.sh all
 
-# Run unit tests only (no infra needed)
+# Run unit tests. The O5 buzz-db gates require a reachable test PostgreSQL.
 test-unit:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -309,12 +309,11 @@ test-unit:
         cargo nextest run -p buzz-core -p buzz-auth --lib
         cargo nextest run -p buzz-voice --lib
         cargo nextest run -p buzz-cli
-        # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).
-        # They guard the embedded-migrator invariant (exactly the consolidated
-        # 0001; cutover/backfill stays an operator script, not startup state)
-        # and the tenant-scoping lints. The Postgres-backed buzz-db tests are
-        # #[ignore]d, so --lib runs only the infra-free set. Without this gate a
-        # stray file in migrations/ or a broken lint ships green.
+        # buzz-db includes pure migration/lint tests and non-vacuous O5
+        # PostgreSQL atomicity/concurrency gates. CI supplies an isolated
+        # service; local callers must provide BUZZ_TEST_DATABASE_URL or the
+        # documented localhost test database. Without this gate, migration
+        # drift or an unreachable database could ship green.
         cargo nextest run -p buzz-db --lib
         # Multi-tenant conformance gate (buzz-conformance): the independent
         # replay checker + golden fixtures. No infra — pure in-process trace
