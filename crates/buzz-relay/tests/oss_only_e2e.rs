@@ -9,14 +9,30 @@
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{bail, ensure, Context, Result};
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use buzz_auth::{
+    AuthTransport, AuthorizationCapability, AuthorizationClock, AuthorizationClockError,
+    AuthorizationTime, VerifiedEvidenceAdapter,
+};
+use buzz_core::CommunityId;
+use buzz_relay::authorization_runtime::{
+    finalization::AuthorizationMode,
+    transport::{
+        DomainTransportPolicy, ProtectedAuthorizationResolver, ProtectedOperationRequest,
+        ProtectedResolution, ProtectedResolutionError, ProtectedTransportError,
+        ProtectedTransportRuntime, VerifiedProviderEvidenceResolution,
+        VerifiedProviderEvidenceResolutionError, VerifiedProviderEvidenceResolver,
+    },
+};
 use buzz_ws_client::{build_auth_event, parse_relay_message, RelayMessage};
 use futures_util::{SinkExt, StreamExt};
-use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp, ToBech32};
+use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, RelayUrl, Tag, Timestamp, ToBech32};
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -255,6 +271,40 @@ struct LiveScenario {
     channel_id: Uuid,
 }
 
+struct UnreachableAuthorizationResolver;
+
+#[async_trait]
+impl ProtectedAuthorizationResolver for UnreachableAuthorizationResolver {
+    async fn resolve(
+        &self,
+        _request: &ProtectedOperationRequest,
+    ) -> std::result::Result<ProtectedResolution, ProtectedResolutionError> {
+        panic!("ambiguous provider evidence must deny before authority resolution")
+    }
+}
+
+struct AmbiguousProviderEvidenceResolver;
+
+impl VerifiedProviderEvidenceResolver for AmbiguousProviderEvidenceResolver {
+    fn resolve(
+        &self,
+        _request: &ProtectedOperationRequest,
+    ) -> std::result::Result<
+        VerifiedProviderEvidenceResolution,
+        VerifiedProviderEvidenceResolutionError,
+    > {
+        Ok(VerifiedProviderEvidenceResolution::Ambiguous)
+    }
+}
+
+struct FixedAuthorizationClock;
+
+impl AuthorizationClock for FixedAuthorizationClock {
+    fn now(&self) -> std::result::Result<AuthorizationTime, AuthorizationClockError> {
+        Ok(AuthorizationTime::from_unix_seconds(1))
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the repository-managed two-relay OSS topology"]
 async fn live_two_relay_clients_and_migrations() {
@@ -262,6 +312,9 @@ async fn live_two_relay_clients_and_migrations() {
     verify_exact_migration_chain(&config)
         .await
         .expect("M01 exact SQLx migration chain");
+    ambiguous_provider_evidence_denies_runtime(&config)
+        .await
+        .expect("D02 ambiguous typed provider evidence denies in the relay runtime");
     let scenario = websocket_http_fanout(&config)
         .await
         .expect("A01 real WebSocket/HTTP cross-relay fan-out");
@@ -277,6 +330,53 @@ async fn live_two_relay_clients_and_migrations() {
     runtime_canaries_are_absent(&config)
         .await
         .expect("P01 runtime logs, errors, and metrics redact planted canaries");
+}
+
+async fn ambiguous_provider_evidence_denies_runtime(config: &LiveConfig) -> Result<()> {
+    let authorization_domain = CommunityId::from_uuid(Uuid::new_v4());
+    let keys = Keys::generate();
+    let challenge = "oss-e2e-d02-ambiguous-provider-evidence";
+    let relay_url = RelayUrl::parse(&config.relay_identity).context("parse relay identity")?;
+    let auth_event = EventBuilder::auth(challenge, relay_url)
+        .sign_with_keys(&keys)
+        .context("sign D02 synthetic NIP-42 proof")?;
+    let proof = VerifiedEvidenceAdapter::new()
+        .verify_nip42(
+            authorization_domain,
+            AuthTransport::RelayWebSocket,
+            &auth_event,
+            challenge,
+            &config.relay_identity,
+            None,
+        )
+        .context("verify D02 synthetic NIP-42 proof")?;
+    let request = ProtectedOperationRequest::new(
+        Arc::new(proof),
+        None,
+        AuthorizationCapability::CommunityRead,
+        Uuid::new_v4(),
+        "ws_req",
+    )
+    .context("construct D02 typed protected request")?;
+    let runtime = ProtectedTransportRuntime::new(
+        [DomainTransportPolicy::from_server_configuration(
+            authorization_domain,
+            AuthorizationMode::Enforce,
+        )],
+        Arc::new(UnreachableAuthorizationResolver),
+        Arc::new(FixedAuthorizationClock),
+    )
+    .context("construct D02 relay authorization runtime")?
+    .with_provider_evidence_resolver(Arc::new(AmbiguousProviderEvidenceResolver));
+
+    ensure!(
+        matches!(
+            runtime.authorize(&request).await,
+            Err(ProtectedTransportError::AmbiguousProviderEvidence)
+        ),
+        "D02 ambiguous typed provider evidence did not fail closed"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
