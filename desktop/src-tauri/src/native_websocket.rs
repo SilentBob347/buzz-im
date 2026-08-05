@@ -377,9 +377,9 @@ impl WebSocketManager {
 
         if let Some((id, handle, epoch, attempt, presentation_token, fresh_until)) = expiry {
             let manager = self.clone();
-            let expires_after = duration_until_unix_second(fresh_until);
+            let expires_at = monotonic_deadline_after(duration_until_unix_second(fresh_until));
             let _ = tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(expires_after).await;
+                status_expiry_sleep(expires_at).await;
                 manager
                     .expire_projection_if_owner(
                         id,
@@ -1112,6 +1112,15 @@ fn duration_until_unix_second(unix_second: u64) -> Duration {
         .unwrap_or_default()
 }
 
+fn monotonic_deadline_after(delay: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(delay).unwrap_or(now)
+}
+
+fn status_expiry_sleep(deadline: tokio::time::Instant) -> tokio::time::Sleep {
+    tokio::time::sleep_until(deadline)
+}
+
 fn outbound_message(message: Message) -> OutboundMessage {
     match message {
         Message::Text(value) => OutboundMessage::Text(value.to_string()),
@@ -1649,6 +1658,19 @@ mod tests {
             .expire_projection_if_owner(13, &handle, &epoch, 2, 3, fresh_until)
             .await;
         assert!(manager.projection.lock().await.current.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_expiry_sleep_keeps_deadline_across_delayed_first_poll() {
+        let deadline = monotonic_deadline_after(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let sleep = status_expiry_sleep(deadline);
+        assert_eq!(sleep.deadline(), deadline);
+        sleep.await;
+
+        let overflow_deadline = monotonic_deadline_after(Duration::MAX);
+        assert!(overflow_deadline <= tokio::time::Instant::now());
     }
 
     #[tokio::test]
