@@ -16,6 +16,7 @@ import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
 import type { ProfileActivityAgent } from "@/features/profile/lib/profileActivityAgent";
+import { resolveSecondaryNip05Label } from "@/features/profile/lib/identity";
 import type {
   useFollowMutation,
   useUnfollowMutation,
@@ -487,6 +488,10 @@ function ProfileHero({
   userStatus: ProfileSummaryViewProps["userStatus"];
 }) {
   const presenceDotClassName = isBot ? "h-4.5 w-4.5" : "h-3.5 w-3.5";
+  const nip05Handle = resolveSecondaryNip05Label(
+    displayName,
+    profile?.nip05Handle,
+  );
 
   return (
     <div className="flex flex-col items-center gap-3 text-center">
@@ -544,8 +549,8 @@ function ProfileHero({
           />
         ) : null}
 
-        {profile?.nip05Handle ? (
-          <p className="text-sm text-muted-foreground">{profile.nip05Handle}</p>
+        {nip05Handle ? (
+          <p className="text-sm text-muted-foreground">{nip05Handle}</p>
         ) : null}
 
         {userStatus ? (

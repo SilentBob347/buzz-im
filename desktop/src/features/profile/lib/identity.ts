@@ -162,6 +162,15 @@ export function resolveUserSecondaryLabel(input: {
   return null;
 }
 
+/** Returns a trimmed NIP-05 label only when it adds distinct secondary text. */
+export function resolveSecondaryNip05Label(
+  primaryLabel: string,
+  nip05Handle: string | null | undefined,
+): string | null {
+  const handle = nip05Handle?.trim();
+  return handle && handle !== primaryLabel.trim() ? handle : null;
+}
+
 /**
  * Label for an agent's owner: "you" when the current user owns it, otherwise
  * the owner's display name, NIP-05 handle, or truncated pubkey.

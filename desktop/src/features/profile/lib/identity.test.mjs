@@ -5,6 +5,7 @@ import {
   formatOwnerLabel,
   formatProfileLabel,
   profileLookupsEqual,
+  resolveSecondaryNip05Label,
   resolveUserLabel,
   truncatePubkey,
 } from "./identity.ts";
@@ -220,4 +221,16 @@ test("resolved user labels preserve the safe fallback chain", () => {
     }),
     truncatePubkey(USER_PUBKEY),
   );
+});
+
+test("secondary NIP-05 labels do not duplicate the primary label", () => {
+  assert.equal(
+    resolveSecondaryNip05Label("user@nip05.test", " user@nip05.test "),
+    null,
+  );
+  assert.equal(
+    resolveSecondaryNip05Label("Profile name", " user@nip05.test "),
+    "user@nip05.test",
+  );
+  assert.equal(resolveSecondaryNip05Label("Profile name", " "), null);
 });

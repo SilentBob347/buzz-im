@@ -28,6 +28,7 @@ import {
   formatProfileLabel,
   formatOwnerLabel,
   ownsAuthorAgent,
+  resolveSecondaryNip05Label,
 } from "@/features/profile/lib/identity";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { usePresenceQuery } from "@/features/presence/hooks";
@@ -280,7 +281,9 @@ export function UserProfilePopover({
   const userStatusText = userStatus?.text.trim() ?? "";
   const hasUserStatus = Boolean(userStatusText || userStatus?.emoji);
   const profileDescription = profile?.about?.trim() ?? "";
-  const profileSubheader = profileDescription || profile?.nip05Handle?.trim();
+  const profileSubheader =
+    profileDescription ||
+    resolveSecondaryNip05Label(displayName, profile?.nip05Handle);
   const activeTurns = useAgentWorking(isBotProfile ? pubkey : null).channels;
   const channelsQuery = useChannelsQuery();
   const channelIdToName = React.useMemo(() => {
