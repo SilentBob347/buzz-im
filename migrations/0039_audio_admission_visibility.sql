@@ -2,11 +2,32 @@
 -- `active` remains authorization for an attempt, never proof of presence.
 
 ALTER TABLE audio_session_admissions
+    ADD COLUMN claimant_id UUID,
+    ADD COLUMN attachment_generation BIGINT NOT NULL DEFAULT 0
+        CHECK (attachment_generation >= 0),
+    ADD COLUMN claim_expires_at TIMESTAMPTZ,
     ADD COLUMN visibility_observed_at TIMESTAMPTZ;
 
+-- A pre-cutover process-local attachment cannot be reconstructed safely. End
+-- every nonterminal attempt fail-closed, while assigning a stable migration
+-- claimant only to already-terminal history so the final visibility-aware
+-- invariant is additive on populated databases.
+UPDATE audio_session_admissions
+SET state = 'aborted',
+    state_version = state_version + 1,
+    aborted_at = COALESCE(aborted_at, clock_timestamp()),
+    updated_at = clock_timestamp(),
+    failure_code = 'upgrade_reconciliation'
+WHERE state IN ('reserved', 'active');
+
+UPDATE audio_session_admissions
+SET claimant_id = admission_id,
+    attachment_generation = 1,
+    claim_expires_at = lease_expires_at
+WHERE state = 'finished';
+
 ALTER TABLE audio_session_admissions
-    DROP CONSTRAINT audio_session_admissions_state,
-    DROP CONSTRAINT audio_session_admissions_claim;
+    DROP CONSTRAINT audio_session_admissions_state;
 
 ALTER TABLE audio_session_admissions
     ADD CONSTRAINT audio_session_admissions_state

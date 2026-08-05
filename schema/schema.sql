@@ -64,6 +64,25 @@ CREATE TABLE communities (
 
 CREATE UNIQUE INDEX idx_communities_host ON communities (lower(host));
 
+-- ── Git repo name registry (NIP-34 kind:30617) ───────────────────────────────
+-- Desired-state equivalent of additive migrations 0002 and 0034. Repository
+-- names are scoped to their community, and protected unpublished reservations
+-- remain distinguishable from legacy reservations that require an object-store
+-- pointer.
+
+CREATE TABLE git_repo_names (
+    community_id       UUID NOT NULL REFERENCES communities(id),
+    repo_id            TEXT NOT NULL,
+    owner_pubkey       TEXT NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    publication_origin TEXT NOT NULL DEFAULT 'legacy'
+        CHECK (publication_origin IN ('legacy', 'protected_unpublished')),
+    PRIMARY KEY (community_id, repo_id)
+);
+
+CREATE INDEX idx_git_repo_names_owner
+    ON git_repo_names (community_id, owner_pubkey);
+
 -- ── Channels ──────────────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". `community_id` immutable.
 -- Channel UUIDs stay valid wire identifiers, but they are NOT globally unique:
