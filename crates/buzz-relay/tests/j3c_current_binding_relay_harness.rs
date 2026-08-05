@@ -35,8 +35,8 @@ use buzz_auth::{
     VerificationOnlyDisposition, VerificationStatusPolicy, VerifiedNostrProof,
 };
 use buzz_core::client_binding_bootstrap::{
-    ClientBindingBootstrapInputV1, ClientBindingEpoch, CLIENT_BINDING_BOOTSTRAP_SUB_ID,
-    CLIENT_BINDING_EPOCH_HEADER, CLIENT_BINDING_STATUS_SUB_ID,
+    ClientBindingBootstrapInputV1, ClientBindingEpoch, ClientBindingScopeV1,
+    CLIENT_BINDING_BOOTSTRAP_SUB_ID, CLIENT_BINDING_SCOPE_TAG, CLIENT_BINDING_STATUS_SUB_ID,
 };
 use buzz_core::client_binding_status::{
     ClientBindingStatusError, ClientBindingStatusFoldError, ClientBindingStatusInputV1,
@@ -58,16 +58,11 @@ use client_binding_status_session::{
     ClientBindingStatusSession, CurrentProjection, ProjectionUpdate,
 };
 use futures::{SinkExt, StreamExt};
-use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, RelayUrl, Timestamp};
+use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::handshake::server::{
-    Request as ServerRequest, Response as ServerResponse,
-};
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -543,42 +538,38 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     let domain = CommunityId::from_uuid(Uuid::new_v4());
     let wrong_domain = CommunityId::from_uuid(Uuid::new_v4());
     let connection_id = Uuid::new_v4();
-    let epoch = ClientBindingEpoch::from_random_bytes(rand::random());
+    let epoch = ClientBindingEpoch::new_v4();
     let challenge = Uuid::new_v4().to_string();
-    let auth_event = EventBuilder::auth(
-        challenge.clone(),
-        RelayUrl::parse(&relay_url).expect("loopback relay URL is valid"),
-    )
-    .sign_with_keys(&author)
-    .expect("ephemeral author signs NIP-42 proof");
+    let auth_event = EventBuilder::new(Kind::Custom(22242), "")
+        .tags([
+            Tag::parse(vec!["relay", relay_url.as_str()]).expect("loopback relay tag is valid"),
+            Tag::parse(vec!["challenge", challenge.as_str()])
+                .expect("ephemeral challenge tag is valid"),
+            Tag::parse(vec![
+                CLIENT_BINDING_SCOPE_TAG.to_string(),
+                "1".to_string(),
+                epoch.as_str().to_string(),
+                relay.public_key().to_hex(),
+            ])
+            .expect("native status scope tag is valid"),
+        ])
+        .sign_with_keys(&author)
+        .expect("ephemeral author signs scoped NIP-42 proof");
 
     let connections = Arc::new(ConnectionManager::new());
     let (mut outbound_rx, _ctrl_rx) = register_connection(&connections, connection_id, domain);
     let (expected_frame_tx, mut expected_frame_rx) = mpsc::unbounded_channel::<String>();
-    let (epoch_header_tx, epoch_header_rx) = oneshot::channel::<Option<String>>();
-    let (auth_proof_tx, auth_proof_rx) = oneshot::channel::<VerifiedNostrProof>();
+    let (auth_proof_tx, auth_proof_rx) =
+        oneshot::channel::<(VerifiedNostrProof, ClientBindingScopeV1)>();
     let server_relay_url = relay_url.clone();
     let server_challenge = challenge.clone();
+    let expected_relay_signer = relay.public_key();
     let server = tokio::spawn(async move {
         let (tcp, peer) = listener.accept().await.expect("loopback client connects");
         assert!(peer.ip().is_loopback(), "harness must remain loopback-only");
-        let mut epoch_header_tx = Some(epoch_header_tx);
-        let mut websocket = tokio_tungstenite::accept_hdr_async(
-            tcp,
-            move |request: &ServerRequest, response: ServerResponse| {
-                let value = request
-                    .headers()
-                    .get(CLIENT_BINDING_EPOCH_HEADER)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                if let Some(sender) = epoch_header_tx.take() {
-                    let _ = sender.send(value);
-                }
-                Ok(response)
-            },
-        )
-        .await
-        .expect("loopback WebSocket upgrades");
+        let mut websocket = tokio_tungstenite::accept_async(tcp)
+            .await
+            .expect("loopback WebSocket upgrades");
 
         let auth_text = match websocket.next().await {
             Some(Ok(Message::Text(text))) => text,
@@ -599,8 +590,11 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
                 None,
             )
             .expect("Buzz verifier seals AUTH received over loopback");
+        let status_scope = ClientBindingScopeV1::from_verified_auth_event(&event)
+            .expect("verified AUTH carries one exact signed status scope");
+        assert_eq!(status_scope.relay_signer(), expected_relay_signer);
         auth_proof_tx
-            .send(proof)
+            .send((proof, status_scope))
             .expect("test driver awaits verified AUTH evidence");
 
         let mut sent = 0usize;
@@ -623,25 +617,9 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
         sent
     });
 
-    let mut request = relay_url
-        .as_str()
-        .into_client_request()
-        .expect("loopback WebSocket request is valid");
-    request.headers_mut().insert(
-        CLIENT_BINDING_EPOCH_HEADER,
-        HeaderValue::from_str(epoch.as_str()).expect("canonical epoch is a valid header"),
-    );
-    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+    let (mut socket, _) = tokio_tungstenite::connect_async(&relay_url)
         .await
         .expect("real loopback WebSocket client connects");
-    let received_epoch = epoch_header_rx
-        .await
-        .expect("loopback handshake reports epoch header")
-        .expect("native epoch header is present");
-    assert_eq!(
-        ClientBindingEpoch::parse(&received_epoch).expect("server parses canonical epoch"),
-        epoch
-    );
     socket
         .send(Message::Text(
             json!([
@@ -653,10 +631,12 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
         ))
         .await
         .expect("real AUTH frame crosses loopback WebSocket");
-    let proof = auth_proof_rx
+    let (proof, status_scope) = auth_proof_rx
         .await
         .expect("server returns exact verified AUTH evidence");
     assert_eq!(proof.actor_pubkey(), author.public_key());
+    assert_eq!(status_scope.connection_epoch(), &epoch);
+    assert_eq!(status_scope.relay_signer(), relay.public_key());
     connections.set_authenticated_pubkey(connection_id, proof.actor_pubkey().to_bytes().to_vec());
 
     let (disposition, privacy_key) =
@@ -671,13 +651,21 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
 
     let transport = ConnectionManagerClientStatusTransport::new(Arc::clone(&connections));
 
-    let bootstrap =
-        ClientBindingBootstrapInputV1::new(domain, author.public_key(), epoch.clone(), now)
-            .expect("authenticated connection scope creates bootstrap input")
-            .sign_with_relay_keys(&relay)
-            .expect("relay signs exact connection bootstrap");
-    let mut session =
-        ClientBindingStatusSession::new(relay.public_key(), author.public_key(), epoch.clone());
+    let authenticated_epoch = status_scope.connection_epoch().clone();
+    let bootstrap = ClientBindingBootstrapInputV1::new(
+        domain,
+        author.public_key(),
+        authenticated_epoch.clone(),
+        now,
+    )
+    .expect("authenticated connection scope creates bootstrap input")
+    .sign_with_relay_keys(&relay)
+    .expect("relay signs exact connection bootstrap");
+    let mut session = ClientBindingStatusSession::new(
+        relay.public_key(),
+        author.public_key(),
+        authenticated_epoch,
+    );
     let (bootstrap_text, received_bootstrap) = enqueue_and_receive_event(
         &connections,
         connection_id,

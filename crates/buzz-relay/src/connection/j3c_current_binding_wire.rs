@@ -127,7 +127,7 @@ async fn production_outbound_bytes_cross_loopback_into_native_status_session() {
     let relay = Keys::generate();
     let author = Keys::generate();
     let domain = CommunityId::from_uuid(Uuid::new_v4());
-    let epoch = ClientBindingEpoch::from_random_bytes(rand::random());
+    let epoch = ClientBindingEpoch::new_v4();
     let connection_id = Uuid::new_v4();
     let now = Timestamp::now().as_secs();
     let fresh_until = now + 120;
