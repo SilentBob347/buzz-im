@@ -9,8 +9,8 @@ import {
 } from "./currentBindingStatusTrace";
 
 const trace = loadCurrentBindingStatusTrace();
-const PROFILE_SPOOF_PREFIX = "profile-spoof-must-not-authorize";
-const PROFILE_NIP05_PREFIX = "profile-nip05-must-not-authorize";
+const LEGACY_VERIFIED_NAME_MARKER = "legacy-verified-name-must-not-authorize";
+const LEGACY_ALIAS_MARKER = "legacy-relay-alias-must-not-authorize";
 
 async function waitForMockLiveSubscription(page: Page) {
   await expect
@@ -92,8 +92,8 @@ async function expectOnlyAuthorBadge(
     projection.eventAuthorPubkey,
     String(projection.freshUntil),
     projection.connectionEpoch,
-    PROFILE_SPOOF_PREFIX,
-    PROFILE_NIP05_PREFIX,
+    LEGACY_VERIFIED_NAME_MARKER,
+    LEGACY_ALIAS_MARKER,
     "eventauthorpubkey",
     "freshuntil",
     "connectionepoch",
@@ -125,6 +125,11 @@ test("Rust native-flow trace drives exact-author lifecycle presentation", async 
   const expiryProjection = currentProjections.reduce((earliest, projection) =>
     projection.freshUntil < earliest.freshUntil ? projection : earliest,
   );
+  const activationStep = traceStep(trace, "current");
+  const activationProjection = activationStep.projection;
+  if (activationProjection === null) {
+    throw new Error("Native current trace step must contain a projection.");
+  }
   const clockStartSeconds = expiryProjection.freshUntil - 2;
   if (clockStartSeconds <= 0) {
     throw new Error(
@@ -136,8 +141,8 @@ test("Rust native-flow trace drives exact-author lifecycle presentation", async 
   await installMockBridge(page, {
     searchProfiles: [...projectedAuthors].map((pubkey, index) => ({
       pubkey,
-      displayName: `${PROFILE_SPOOF_PREFIX}-${index}`,
-      nip05Handle: `${PROFILE_NIP05_PREFIX}-${index}@example.invalid`,
+      displayName: `${LEGACY_VERIFIED_NAME_MARKER}-${index}`,
+      nip05Handle: `${LEGACY_ALIAS_MARKER}-${index}@example.invalid`,
     })),
   });
   await page.goto("/");
@@ -154,7 +159,7 @@ test("Rust native-flow trace drives exact-author lifecycle presentation", async 
     const row = page.getByTestId("message-row").filter({ hasText: content });
     await expect(row).toBeVisible();
     await expect(row.getByTestId("message-author")).toContainText(
-      `${PROFILE_SPOOF_PREFIX}-${index}`,
+      `${LEGACY_VERIFIED_NAME_MARKER}-${index}`,
     );
     rows.set(pubkey, row);
   }
@@ -173,13 +178,49 @@ test("Rust native-flow trace drives exact-author lifecycle presentation", async 
   rows.set(otherAuthor, otherRow);
 
   for (const step of trace.steps) {
-    await forwardTraceStep(page, step);
-    if (step.projection === null) {
-      await expect(page.getByTestId("current-relay-binding")).toHaveCount(0);
-    } else {
-      await expectOnlyAuthorBadge(page, rows, step.projection);
-    }
+    if (step.case === "passive-expiry") continue;
+
+    await test.step(`${step.case} projects its retained browser state`, async () => {
+      if (step.projection === null) {
+        // Every clear transition starts from a visible Rust-produced current
+        // projection so a pre-cleared store can never make the assertion pass.
+        await forwardTraceStep(page, activationStep);
+        await expectOnlyAuthorBadge(page, rows, activationProjection);
+      }
+
+      await forwardTraceStep(page, step);
+      if (step.projection === null) {
+        await expect(page.getByTestId("current-relay-binding")).toHaveCount(0);
+      } else {
+        await expectOnlyAuthorBadge(page, rows, step.projection);
+      }
+    });
   }
+
+  // The existing mock profile seed reaches ordinary displayName/NIP-05 fields
+  // but intentionally exposes no dormant verifiedName field. Prove those
+  // legacy-looking markers cannot enter trust-specific badge or panel UI.
+  const activationRow = rows.get(activationProjection.eventAuthorPubkey);
+  if (!activationRow) throw new Error("Activation author row is absent.");
+  await activationRow.getByRole("button").first().click();
+  const profilePanel = page.getByTestId("user-profile-panel");
+  await expect(profilePanel).toBeVisible();
+  await expect(profilePanel).toContainText(LEGACY_VERIFIED_NAME_MARKER);
+  await expect(profilePanel).toContainText(LEGACY_ALIAS_MARKER);
+  await expect(profilePanel.getByTestId("relay-verified-identity")).toHaveCount(
+    0,
+  );
+  await expect(
+    profilePanel.locator('[aria-label^="Relay-verified identity"]'),
+  ).toHaveCount(0);
+  await expect(
+    profilePanel.getByText("Binding active", { exact: false }),
+  ).toHaveCount(0);
+  await expect(
+    profilePanel.getByText("Verified as", { exact: false }),
+  ).toHaveCount(0);
+  await page.getByTestId("auxiliary-panel-close").click();
+  await expect(profilePanel).toHaveCount(0);
 
   // These native lifecycle outputs must all clear presentation. Naming them
   // explicitly keeps this browser layer non-vacuous if the trace grows later.
@@ -202,7 +243,7 @@ test("Rust native-flow trace drives exact-author lifecycle presentation", async 
   expect(traceStep(trace, "reconnect").projection).not.toBeNull();
   await expectNoLegacyTrustPresentation(page);
 
-  // Re-deliver an unchanged DTO produced by Rust while the browser clock is
+  // Deliver an unchanged DTO produced by Rust while the browser clock is
   // before its deadline, then advance to the exclusive boundary. No later
   // trace event, render fixture, or navigation clears it.
   const expiryStep = trace.steps.find(
