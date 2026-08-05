@@ -178,7 +178,13 @@ impl ClientBindingStatusSession {
             return self.clear_trusted_invalid();
         }
         if !reserved.exact_outer_shape {
-            if self.tracker.is_none() {
+            if let Some(tracker) = self.tracker.as_mut() {
+                // The outer frame is trusted-invalid, but a valid inner status
+                // must still consume its revision so replaying the identical
+                // event later in an exact array cannot restore presentation.
+                let _ = tracker.accept(&event, now);
+                tracker.on_disconnect();
+            } else {
                 self.bootstrap_latched_invalid = true;
             }
             return self.clear_trusted_invalid();
