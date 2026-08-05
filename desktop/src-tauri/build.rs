@@ -112,13 +112,7 @@ fn main() {
         tauri_build::Attributes::new().plugin(
             "websocket",
             tauri_build::InlinedPlugin::new()
-                .commands(&[
-                    "connect",
-                    "send",
-                    "disconnect",
-                    "disconnect_all",
-                    "current_projection",
-                ])
+                .commands(&["connect", "send", "disconnect", "disconnect_all"])
                 .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
         ),
     )

@@ -214,6 +214,12 @@ pub async fn apply_workspace(
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
 
+    // Fence work that raced the mutation after the pre-mutation invalidation.
+    restore_app
+        .state::<crate::native_websocket::WebSocketManager>()
+        .invalidate_projection()
+        .await;
+
     let state = restore_app.state::<AppState>();
     // Backfill this exact relay+owner scope only after the workspace has been
     // applied. Running at process boot would target the fallback relay and

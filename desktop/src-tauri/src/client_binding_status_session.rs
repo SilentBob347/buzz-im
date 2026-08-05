@@ -182,7 +182,9 @@ impl ClientBindingStatusSession {
                 // The outer frame is trusted-invalid, but a valid inner status
                 // must still consume its revision so replaying the identical
                 // event later in an exact array cannot restore presentation.
-                let _ = tracker.accept(&event, now);
+                if tracker.accept(&event, now).is_err() {
+                    tracker.retain_trusted_invalid_high_water(&event);
+                }
                 tracker.on_disconnect();
             } else {
                 self.bootstrap_latched_invalid = true;
@@ -207,7 +209,10 @@ impl ClientBindingStatusSession {
                     connection_epoch: self.connection_epoch.as_str().to_owned(),
                 })
             }
-            Err(_) => self.clear_trusted_invalid(),
+            Err(_) => {
+                tracker.retain_trusted_invalid_high_water(&event);
+                self.clear_trusted_invalid()
+            }
         }
     }
 
@@ -269,7 +274,7 @@ mod tests {
     }
 
     fn epoch() -> ClientBindingEpoch {
-        ClientBindingEpoch::from_random_bytes([0x11; 32])
+        ClientBindingEpoch::parse("11111111-1111-4111-8111-111111111111").expect("synthetic epoch")
     }
 
     fn session(relay: &Keys, author: &Keys) -> ClientBindingStatusSession {
@@ -514,6 +519,72 @@ mod tests {
             ),
             &author,
             3,
+        );
+    }
+
+    #[test]
+    fn trusted_invalid_parseable_revision_advances_hidden_high_water() {
+        let relay = Keys::generate();
+        let author = Keys::generate();
+        let mut session = session(&relay, &author);
+        assert_unchanged(session.consume_text(
+            &frame(CLIENT_BINDING_BOOTSTRAP_SUB_ID, &bootstrap(&relay, &author)),
+            ISSUED_AT,
+        ));
+        let first = status(
+            &relay,
+            &author,
+            1,
+            ClientBindingStatusDisposition::DisplayCurrent,
+            "policy-v1",
+        );
+        assert_current(
+            session.consume_text(&frame(CLIENT_BINDING_STATUS_SUB_ID, &first), ISSUED_AT),
+            &author,
+            1,
+        );
+
+        let revision_four = status(
+            &relay,
+            &author,
+            4,
+            ClientBindingStatusDisposition::DisplayCurrent,
+            "policy-v4",
+        );
+        let mut invalid_payload: Value =
+            serde_json::from_str(&revision_four.content).expect("synthetic status payload");
+        invalid_payload["authorization_domain"] = json!("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let trusted_invalid = EventBuilder::new(
+            Kind::Custom(buzz_core_pkg::kind::KIND_CLIENT_BINDING_STATUS as u16),
+            invalid_payload.to_string(),
+        )
+        .tags([])
+        .custom_created_at(Timestamp::from(ISSUED_AT))
+        .sign_with_keys(&relay)
+        .expect("trusted-invalid status signs");
+        assert_clear(session.consume_text(
+            &frame(CLIENT_BINDING_STATUS_SUB_ID, &trusted_invalid),
+            ISSUED_AT,
+        ));
+        assert_clear(session.consume_text(
+            &frame(CLIENT_BINDING_STATUS_SUB_ID, &revision_four),
+            ISSUED_AT,
+        ));
+
+        let revision_five = status(
+            &relay,
+            &author,
+            5,
+            ClientBindingStatusDisposition::DisplayCurrent,
+            "policy-v5",
+        );
+        assert_current(
+            session.consume_text(
+                &frame(CLIENT_BINDING_STATUS_SUB_ID, &revision_five),
+                ISSUED_AT,
+            ),
+            &author,
+            5,
         );
     }
 

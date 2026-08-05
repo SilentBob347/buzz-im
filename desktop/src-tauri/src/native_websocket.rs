@@ -9,14 +9,13 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{
         client::IntoClientRequest,
-        http::HeaderValue,
         protocol::{frame::coding::CloseCode, CloseFrame, Message},
     },
 };
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use buzz_core_pkg::client_binding_bootstrap::{ClientBindingEpoch, CLIENT_BINDING_EPOCH_HEADER};
+use buzz_core_pkg::client_binding_bootstrap::ClientBindingEpoch;
 
 use crate::{
     app_state::AppState,
@@ -96,10 +95,48 @@ struct ConnectionHandle {
     sender: mpsc::Sender<SendRequest>,
     cancel: CancellationToken,
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    status_scope: Mutex<Option<StatusScope>>,
+}
+
+struct StatusScope {
+    relay_url: String,
+    relay_signer: PublicKey,
+    expected_author: PublicKey,
+    epoch: ClientBindingEpoch,
+    projection_channel: Channel<serde_json::Value>,
+    generation: u64,
+    challenge: Option<String>,
+    auth_proven: bool,
+}
+
+struct PreparedStatus {
+    session: ClientBindingStatusSession,
+    scope: StatusScope,
+}
+
+pub(crate) struct StatusAuthProof {
+    handle: Arc<ConnectionHandle>,
+    challenge: String,
+    relay_url: String,
+    relay_signer: PublicKey,
+    expected_author: PublicKey,
+    epoch: ClientBindingEpoch,
+    generation: u64,
+}
+
+impl StatusAuthProof {
+    pub(crate) fn connection_epoch(&self) -> &ClientBindingEpoch {
+        &self.epoch
+    }
+
+    pub(crate) const fn relay_signer(&self) -> PublicKey {
+        self.relay_signer
+    }
 }
 
 struct ProjectionOwner {
     id: Id,
+    handle: Arc<ConnectionHandle>,
     epoch: ClientBindingEpoch,
     channel: Channel<serde_json::Value>,
 }
@@ -107,6 +144,7 @@ struct ProjectionOwner {
 #[derive(Default)]
 struct ProjectionState {
     generation: u64,
+    suspended: bool,
     owner: Option<ProjectionOwner>,
     current: Option<CurrentProjection>,
 }
@@ -143,37 +181,66 @@ impl WebSocketManager {
         }
     }
 
-    async fn begin_projection_attempt(&self) -> u64 {
+    async fn projection_generation(&self) -> u64 {
+        self.projection.lock().await.generation
+    }
+
+    async fn status_generation(&self) -> Option<u64> {
+        let projection = self.projection.lock().await;
+        (!projection.suspended).then_some(projection.generation)
+    }
+
+    async fn current_connect_cancel(&self) -> CancellationToken {
+        self.connect_cancel.lock().await.clone()
+    }
+
+    async fn activate_projection_after_auth(&self, id: Id, proof: &StatusAuthProof) -> bool {
+        if !self
+            .connections
+            .lock()
+            .await
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, &proof.handle))
+        {
+            return false;
+        }
         let mut projection = self.projection.lock().await;
-        projection.generation = projection.generation.wrapping_add(1);
+        if projection.suspended || projection.generation != proof.generation {
+            return false;
+        }
+        let mut status_scope = proof.handle.status_scope.lock().await;
+        let Some(scope) = status_scope.as_mut() else {
+            return false;
+        };
+        if scope.generation != proof.generation
+            || scope.auth_proven
+            || scope.challenge.as_deref() != Some(proof.challenge.as_str())
+            || scope.relay_url != proof.relay_url
+            || scope.relay_signer != proof.relay_signer
+            || scope.expected_author != proof.expected_author
+            || scope.epoch != proof.epoch
+        {
+            return false;
+        }
+        scope.auth_proven = true;
         if let Some(previous) = projection.owner.take() {
             let _ = previous.channel.send(serde_json::Value::Null);
         }
         projection.current = None;
-        projection.generation
-    }
-
-    async fn activate_projection(
-        &self,
-        generation: u64,
-        id: Id,
-        epoch: ClientBindingEpoch,
-        channel: Channel<serde_json::Value>,
-    ) -> bool {
-        let mut projection = self.projection.lock().await;
-        if projection.generation != generation {
-            let _ = channel.send(serde_json::Value::Null);
-            return false;
-        }
-        projection.current = None;
-        let _ = channel.send(serde_json::Value::Null);
-        projection.owner = Some(ProjectionOwner { id, epoch, channel });
+        let _ = scope.projection_channel.send(serde_json::Value::Null);
+        projection.owner = Some(ProjectionOwner {
+            id,
+            handle: Arc::clone(&proof.handle),
+            epoch: proof.epoch.clone(),
+            channel: scope.projection_channel.clone(),
+        });
         true
     }
 
     async fn apply_projection_update(
         &self,
         id: Id,
+        handle: &Arc<ConnectionHandle>,
         epoch: &ClientBindingEpoch,
         update: ProjectionUpdate,
     ) {
@@ -184,7 +251,7 @@ impl WebSocketManager {
         let Some(owner) = projection.owner.as_ref() else {
             return;
         };
-        if owner.id != id || owner.epoch != *epoch {
+        if owner.id != id || !Arc::ptr_eq(&owner.handle, handle) || owner.epoch != *epoch {
             return;
         }
         projection.current = match update {
@@ -201,13 +268,16 @@ impl WebSocketManager {
         }
     }
 
-    async fn clear_projection_if_owner(&self, id: Id, epoch: &ClientBindingEpoch) {
+    async fn clear_projection_if_owner(
+        &self,
+        id: Id,
+        handle: &Arc<ConnectionHandle>,
+        epoch: &ClientBindingEpoch,
+    ) {
         let mut projection = self.projection.lock().await;
-        if projection
-            .owner
-            .as_ref()
-            .is_some_and(|owner| owner.id == id && owner.epoch == *epoch)
-        {
+        if projection.owner.as_ref().is_some_and(|owner| {
+            owner.id == id && Arc::ptr_eq(&owner.handle, handle) && owner.epoch == *epoch
+        }) {
             if let Some(owner) = projection.owner.take() {
                 let _ = owner.channel.send(serde_json::Value::Null);
             }
@@ -218,27 +288,127 @@ impl WebSocketManager {
     /// Invalidate all browser-visible status and revoke the current socket's
     /// ownership. Late work from that socket is rejected by the owner fence.
     pub(crate) async fn invalidate_projection(&self) {
-        let mut projection = self.projection.lock().await;
-        projection.generation = projection.generation.wrapping_add(1);
-        if let Some(owner) = projection.owner.take() {
-            let _ = owner.channel.send(serde_json::Value::Null);
-        }
-        projection.current = None;
-    }
-
-    async fn current_projection(&self) -> Option<CurrentProjection> {
-        let mut projection = self.projection.lock().await;
-        if projection
-            .current
-            .as_ref()
-            .is_some_and(|current| unix_now() >= current.fresh_until)
         {
-            projection.current = None;
-            if let Some(owner) = projection.owner.as_ref() {
+            let mut projection = self.projection.lock().await;
+            projection.generation = projection.generation.wrapping_add(1);
+            if let Some(owner) = projection.owner.take() {
                 let _ = owner.channel.send(serde_json::Value::Null);
             }
+            projection.current = None;
         }
-        projection.current.clone()
+        self.cancel_status_connections().await;
+    }
+
+    /// Permanently disable status projection for the remainder of this process.
+    /// Sign-out uses this before starting restart so no racing webview request
+    /// can regain presentation ownership with the retiring identity.
+    pub(crate) async fn suspend_projection(&self) {
+        {
+            let mut projection = self.projection.lock().await;
+            projection.suspended = true;
+            projection.generation = projection.generation.wrapping_add(1);
+            if let Some(owner) = projection.owner.take() {
+                let _ = owner.channel.send(serde_json::Value::Null);
+            }
+            projection.current = None;
+        }
+        self.cancel_status_connections().await;
+    }
+
+    async fn cancel_status_connections(&self) {
+        let handles = self
+            .connections
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for handle in handles {
+            if handle.status_scope.lock().await.take().is_some() {
+                handle.cancel.cancel();
+            }
+        }
+    }
+
+    async fn record_status_challenge(
+        &self,
+        id: Id,
+        handle: &Arc<ConnectionHandle>,
+        challenge: &str,
+    ) {
+        if !self
+            .connections
+            .lock()
+            .await
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            return;
+        }
+        let mut status_scope = handle.status_scope.lock().await;
+        let Some(scope) = status_scope.as_mut() else {
+            return;
+        };
+        match scope.challenge.as_deref() {
+            None => scope.challenge = Some(challenge.to_owned()),
+            Some(existing) if existing == challenge => {}
+            Some(_) => {
+                status_scope.take();
+            }
+        }
+    }
+
+    pub(crate) async fn status_auth_proof(
+        &self,
+        id: Id,
+        challenge: &str,
+        relay_url: &str,
+        expected_author: PublicKey,
+    ) -> Result<StatusAuthProof, String> {
+        let handle = self
+            .connections
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "native WebSocket is not current".to_string())?;
+        let current_generation = self
+            .status_generation()
+            .await
+            .ok_or_else(|| "native WebSocket status is suspended".to_string())?;
+        let scope = handle.status_scope.lock().await;
+        let scope = scope
+            .as_ref()
+            .ok_or_else(|| "native WebSocket is not status-capable".to_string())?;
+        if scope.auth_proven
+            || scope.challenge.as_deref() != Some(challenge)
+            || scope.relay_url != relay_url
+            || scope.expected_author != expected_author
+            || scope.generation != current_generation
+        {
+            return Err("native WebSocket status scope does not match".to_string());
+        }
+        Ok(StatusAuthProof {
+            handle: Arc::clone(&handle),
+            challenge: challenge.to_owned(),
+            relay_url: scope.relay_url.clone(),
+            relay_signer: scope.relay_signer,
+            expected_author: scope.expected_author,
+            epoch: scope.epoch.clone(),
+            generation: scope.generation,
+        })
+    }
+
+    pub(crate) async fn complete_status_auth(
+        &self,
+        id: Id,
+        proof: &StatusAuthProof,
+    ) -> Result<(), String> {
+        if self.activate_projection_after_auth(id, proof).await {
+            Ok(())
+        } else {
+            Err("native WebSocket status scope changed while signing".to_string())
+        }
     }
 
     async fn disconnect_handle(handle: Arc<ConnectionHandle>) {
@@ -262,13 +432,28 @@ impl WebSocketManager {
                 .await
                 .owner
                 .as_ref()
-                .filter(|owner| owner.id == id)
+                .filter(|owner| owner.id == id && Arc::ptr_eq(&owner.handle, &handle))
                 .map(|owner| owner.epoch.clone());
             if let Some(epoch) = owner_epoch {
-                self.clear_projection_if_owner(id, &epoch).await;
+                self.clear_projection_if_owner(id, &handle, &epoch).await;
             }
             Self::disconnect_handle(handle).await;
         }
+    }
+
+    async fn disconnect_all(&self) {
+        self.invalidate_projection().await;
+        let mut connect_cancel = self.connect_cancel.lock().await;
+        connect_cancel.cancel();
+        *connect_cancel = CancellationToken::new();
+        let handles = {
+            let mut connections = self.connections.lock().await;
+            connections
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        futures_util::future::join_all(handles.into_iter().map(Self::disconnect_handle)).await;
     }
 }
 
@@ -278,28 +463,20 @@ async fn open_connection(
     url: &str,
     on_message: Channel<serde_json::Value>,
 ) -> Result<Id, String> {
-    open_connection_with_projection(manager, url, on_message, None, None, None).await
+    let connect_cancel = manager.current_connect_cancel().await;
+    open_connection_with_projection(manager, url, on_message, None, connect_cancel).await
 }
 
 async fn open_connection_with_projection(
     manager: &WebSocketManager,
     url: &str,
     on_message: Channel<serde_json::Value>,
-    mut status_session: Option<ClientBindingStatusSession>,
-    projection_channel: Option<Channel<serde_json::Value>>,
-    projection_generation: Option<u64>,
+    prepared_status: Option<PreparedStatus>,
+    connect_cancel: CancellationToken,
 ) -> Result<Id, String> {
-    let connect_cancel = manager.connect_cancel.lock().await.clone();
-    let mut request = url
+    let request = url
         .into_client_request()
         .map_err(|error| error.to_string())?;
-    if let Some(session) = status_session.as_ref() {
-        request.headers_mut().insert(
-            CLIENT_BINDING_EPOCH_HEADER,
-            HeaderValue::from_str(session.connection_epoch().as_str())
-                .map_err(|_| "invalid WebSocket request".to_string())?,
-        );
-    }
     let (socket, _) = tokio::select! {
         _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
         result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)) => result
@@ -312,6 +489,13 @@ async fn open_connection_with_projection(
     let current_connect_cancel = manager.connect_cancel.lock().await;
     if connect_cancel.is_cancelled() {
         return Err("WebSocket connection cancelled".to_string());
+    }
+    let current_generation = manager.projection_generation().await;
+    if prepared_status
+        .as_ref()
+        .is_some_and(|prepared| prepared.scope.generation != current_generation)
+    {
+        return Err("WebSocket connection scope changed".to_string());
     }
 
     let id = loop {
@@ -326,25 +510,31 @@ async fn open_connection_with_projection(
         sender,
         cancel: cancel.clone(),
         task: Mutex::new(None),
+        status_scope: Mutex::new(prepared_status.as_ref().map(|prepared| StatusScope {
+            relay_url: prepared.scope.relay_url.clone(),
+            relay_signer: prepared.scope.relay_signer,
+            expected_author: prepared.scope.expected_author,
+            epoch: prepared.scope.epoch.clone(),
+            projection_channel: prepared.scope.projection_channel.clone(),
+            generation: prepared.scope.generation,
+            challenge: None,
+            auth_proven: false,
+        })),
     });
     let mut task_slot = handle.task.lock().await;
     manager.connections.lock().await.insert(id, handle.clone());
 
-    let activated = match (
-        status_session.as_ref(),
-        projection_channel.clone(),
-        projection_generation,
-    ) {
-        (Some(session), Some(channel), Some(generation)) => {
-            manager
-                .activate_projection(generation, id, session.connection_epoch().clone(), channel)
-                .await
-        }
-        _ => false,
-    };
-    if !activated {
-        status_session = None;
+    let registered_generation = manager.projection_generation().await;
+    if prepared_status
+        .as_ref()
+        .is_some_and(|prepared| prepared.scope.generation != registered_generation)
+    {
+        manager.remove_if_current(id, &handle).await;
+        handle.cancel.cancel();
+        return Err("WebSocket connection scope changed".to_string());
     }
+
+    let status_session = prepared_status.map(|prepared| prepared.session);
 
     let task_manager = manager.clone();
     let task = tauri::async_runtime::spawn(run_connection_inner(
@@ -372,24 +562,31 @@ async fn connect(
     on_projection: Option<Channel<serde_json::Value>>,
     _config: Option<serde_json::Value>,
 ) -> Result<Id, String> {
-    let projection_generation = match on_projection.as_ref() {
-        Some(_) => Some(manager.begin_projection_attempt().await),
-        None => None,
+    let connect_cancel = manager.current_connect_cancel().await;
+    let generation = manager.status_generation().await;
+    let prepared_status = match (on_projection, generation) {
+        (Some(channel), Some(generation)) => tokio::select! {
+            _ = connect_cancel.cancelled() => {
+                return Err("WebSocket connection cancelled".to_string());
+            }
+            prepared = prepare_status_session(&state, &url, channel, generation) => prepared,
+        },
+        _ => None,
     };
-    if let Some(channel) = on_projection.as_ref() {
-        let _ = channel.send(serde_json::Value::Null);
+    if prepared_status.is_some()
+        && manager.status_generation().await
+            != prepared_status
+                .as_ref()
+                .map(|prepared| prepared.scope.generation)
+    {
+        return Err("WebSocket connection scope changed".to_string());
     }
-    let status_session = match on_projection.as_ref() {
-        Some(_) => prepare_status_session(&state, &url).await,
-        None => None,
-    };
     open_connection_with_projection(
         manager.inner(),
         &url,
         on_message,
-        status_session,
-        on_projection,
-        projection_generation,
+        prepared_status,
+        connect_cancel,
     )
     .await
 }
@@ -397,19 +594,28 @@ async fn connect(
 async fn prepare_status_session(
     state: &AppState,
     requested_url: &str,
-) -> Option<ClientBindingStatusSession> {
+    projection_channel: Channel<serde_json::Value>,
+    generation: u64,
+) -> Option<PreparedStatus> {
     if requested_url != crate::relay::relay_ws_url_with_override(state) {
         return None;
     }
     let expected_author = state.signing_keys().ok()?.public_key();
     let relay_signer = fetch_nip11_signer(requested_url).await.ok()?;
-    let mut epoch_bytes = [0_u8; 32];
-    getrandom::getrandom(&mut epoch_bytes).ok()?;
-    Some(ClientBindingStatusSession::new(
-        relay_signer,
-        expected_author,
-        ClientBindingEpoch::from_random_bytes(epoch_bytes),
-    ))
+    let epoch = ClientBindingEpoch::new_v4();
+    Some(PreparedStatus {
+        session: ClientBindingStatusSession::new(relay_signer, expected_author, epoch.clone()),
+        scope: StatusScope {
+            relay_url: requested_url.to_owned(),
+            relay_signer,
+            expected_author,
+            epoch,
+            projection_channel,
+            generation,
+            challenge: None,
+            auth_proven: false,
+        },
+    })
 }
 
 #[derive(Deserialize)]
@@ -542,19 +748,7 @@ async fn disconnect(manager: tauri::State<'_, WebSocketManager>, id: Id) -> Resu
 
 #[tauri::command]
 async fn disconnect_all(manager: tauri::State<'_, WebSocketManager>) -> Result<(), String> {
-    manager.invalidate_projection().await;
-    let mut connect_cancel = manager.connect_cancel.lock().await;
-    connect_cancel.cancel();
-    *connect_cancel = CancellationToken::new();
-    let handles = {
-        let mut connections = manager.connections.lock().await;
-        connections
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect::<Vec<_>>()
-    };
-    futures_util::future::join_all(handles.into_iter().map(WebSocketManager::disconnect_handle))
-        .await;
+    manager.disconnect_all().await;
     Ok(())
 }
 
@@ -607,7 +801,7 @@ async fn run_connection_inner<S>(
                 if let Some(session) = status_session.as_mut() {
                     let epoch = session.connection_epoch().clone();
                     let update = session.expire(unix_now());
-                    manager.apply_projection_update(id, &epoch, update).await;
+                    manager.apply_projection_update(id, &handle, &epoch, update).await;
                 }
             }
             _ = cancel.cancelled() => {
@@ -633,17 +827,38 @@ async fn run_connection_inner<S>(
             incoming = socket.next() => {
                 let message = match incoming {
                     Some(Ok(message)) => {
-                        let reserved_text = match &message {
-                            Message::Text(value) => Some(value.as_str()),
-                            Message::Binary(value) => std::str::from_utf8(value).ok(),
-                            _ => None,
+                        if let Message::Text(text) = &message {
+                            if let Some(challenge) = nip42_challenge(text) {
+                                manager
+                                    .record_status_challenge(id, &handle, &challenge)
+                                    .await;
+                            }
                         }
-                        .filter(|text| is_reserved_text(text));
+                        let reserved_text = reserved_text_message(&message);
                         if let Some(text) = reserved_text {
-                            if let Some(session) = status_session.as_mut() {
+                            if let Some(mut session) = status_session.take() {
                                 let epoch = session.connection_epoch().clone();
-                                if let Some(update) = session.consume_text(text, unix_now()) {
-                                    manager.apply_projection_update(id, &epoch, update).await;
+                                let folded = tauri::async_runtime::spawn_blocking(move || {
+                                    let update = session.consume_text(&text, unix_now());
+                                    (session, update)
+                                })
+                                .await;
+                                match folded {
+                                    Ok((returned_session, update)) => {
+                                        status_session = Some(returned_session);
+                                        if let Some(update) = update {
+                                            manager
+                                                .apply_projection_update(
+                                                    id, &handle, &epoch, update,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        manager
+                                            .clear_projection_if_owner(id, &handle, &epoch)
+                                            .await;
+                                    }
                                 }
                             }
                             continue;
@@ -664,10 +879,28 @@ async fn run_connection_inner<S>(
     if let Some(session) = status_session.as_mut() {
         let epoch = session.connection_epoch().clone();
         let update = session.disconnect();
-        manager.apply_projection_update(id, &epoch, update).await;
-        manager.clear_projection_if_owner(id, &epoch).await;
+        manager
+            .apply_projection_update(id, &handle, &epoch, update)
+            .await;
+        manager.clear_projection_if_owner(id, &handle, &epoch).await;
     }
     manager.remove_if_current(id, &handle).await;
+}
+
+fn reserved_text_message(message: &Message) -> Option<String> {
+    match message {
+        Message::Text(value) if is_reserved_text(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn nip42_challenge(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let values = value.as_array()?;
+    if values.len() != 2 || values.first().and_then(serde_json::Value::as_str) != Some("AUTH") {
+        return None;
+    }
+    values.get(1)?.as_str().map(str::to_owned)
 }
 
 fn unix_now() -> u64 {
@@ -697,21 +930,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             connect,
             send,
             disconnect,
-            disconnect_all,
-            current_projection
+            disconnect_all
         ])
         .setup(|app, _api| {
             app.manage(WebSocketManager::default());
             Ok(())
         })
         .build()
-}
-
-#[tauri::command]
-async fn current_projection(
-    manager: tauri::State<'_, WebSocketManager>,
-) -> Option<CurrentProjection> {
-    manager.current_projection().await
 }
 
 #[cfg(test)]
@@ -803,6 +1028,7 @@ mod tests {
             sender,
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
+            status_scope: Mutex::new(None),
         });
         manager.connections.lock().await.insert(1, handle.clone());
         let task = tauri::async_runtime::spawn(run_connection(
@@ -847,6 +1073,7 @@ mod tests {
                 ready_tx.send(()).unwrap();
                 std::future::pending::<()>().await;
             }))),
+            status_scope: Mutex::new(None),
         });
         manager.connections.lock().await.insert(7, handle);
         ready_rx.await.unwrap();
@@ -872,6 +1099,7 @@ mod tests {
             task: Mutex::new(Some(tauri::async_runtime::spawn(async {
                 std::future::pending::<()>().await;
             }))),
+            status_scope: Mutex::new(None),
         });
         manager.connections.lock().await.insert(1, handle);
         gate.cancel();
@@ -893,6 +1121,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_all_cancels_pending_connect_generation() {
+        let manager = WebSocketManager::default();
+        let pending = manager.current_connect_cancel().await;
+        let generation = manager.projection_generation().await;
+
+        manager.disconnect_all().await;
+
+        assert!(pending.is_cancelled());
+        assert!(!manager.current_connect_cancel().await.is_cancelled());
+        assert_ne!(manager.projection_generation().await, generation);
+    }
+
+    #[tokio::test]
     async fn one_connection_does_not_block_another_send_queue() {
         let manager = WebSocketManager::default();
         let (blocked_sender, blocked_receiver) = mpsc::channel(1);
@@ -907,6 +1148,7 @@ mod tests {
             sender: blocked_sender,
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
+            status_scope: Mutex::new(None),
         });
         manager.connections.lock().await.insert(1, blocked);
 
@@ -915,6 +1157,7 @@ mod tests {
             sender: healthy_sender.clone(),
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
+            status_scope: Mutex::new(None),
         });
         manager.connections.lock().await.insert(2, healthy);
 
@@ -960,76 +1203,137 @@ mod tests {
         ));
     }
 
+    fn test_epoch(suffix: u8) -> ClientBindingEpoch {
+        ClientBindingEpoch::parse(&format!("11111111-1111-4111-8111-{suffix:012x}"))
+            .expect("synthetic epoch")
+    }
+
+    fn test_handle(status_scope: Option<StatusScope>) -> Arc<ConnectionHandle> {
+        let (sender, _receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        Arc::new(ConnectionHandle {
+            sender,
+            cancel: CancellationToken::new(),
+            task: Mutex::new(None),
+            status_scope: Mutex::new(status_scope),
+        })
+    }
+
+    fn test_status_scope(
+        generation: u64,
+        relay: PublicKey,
+        author: PublicKey,
+        epoch: ClientBindingEpoch,
+    ) -> StatusScope {
+        StatusScope {
+            relay_url: "ws://localhost:3000/".to_string(),
+            relay_signer: relay,
+            expected_author: author,
+            epoch,
+            projection_channel: silent_channel(),
+            generation,
+            challenge: None,
+            auth_proven: false,
+        }
+    }
+
     #[tokio::test]
-    async fn projection_generation_and_owner_epoch_fence_late_updates() {
+    async fn only_proven_status_socket_owns_projection_and_old_handle_is_fenced() {
         let manager = WebSocketManager::default();
-        let stale_generation = manager.begin_projection_attempt().await;
-        let current_generation = manager.begin_projection_attempt().await;
-        let stale_epoch = ClientBindingEpoch::from_random_bytes([0x11; 32]);
-        let current_epoch = ClientBindingEpoch::from_random_bytes([0x22; 32]);
+        let relay = nostr::Keys::generate().public_key();
+        let author = nostr::Keys::generate().public_key();
+        let generation = manager.projection_generation().await;
+        let old_epoch = test_epoch(0x11);
+        let old = test_handle(Some(test_status_scope(
+            generation,
+            relay,
+            author,
+            old_epoch.clone(),
+        )));
+        manager.connections.lock().await.insert(7, old.clone());
+        manager
+            .record_status_challenge(7, &old, "challenge-old")
+            .await;
+        let old_proof = manager
+            .status_auth_proof(7, "challenge-old", "ws://localhost:3000/", author)
+            .await
+            .expect("exact native proof");
+        manager
+            .complete_status_auth(7, &old_proof)
+            .await
+            .expect("old socket owns projection");
 
-        assert!(
-            !manager
-                .activate_projection(stale_generation, 1, stale_epoch.clone(), silent_channel(),)
-                .await
-        );
-        assert!(
-            manager
-                .activate_projection(
-                    current_generation,
-                    2,
-                    current_epoch.clone(),
-                    silent_channel(),
-                )
-                .await
-        );
         let current = CurrentProjection {
-            event_author_pubkey: "11".repeat(32),
+            event_author_pubkey: author.to_hex(),
             fresh_until: u64::MAX,
-            connection_epoch: current_epoch.as_str().to_owned(),
+            connection_epoch: old_epoch.as_str().to_owned(),
         };
-
-        manager
-            .apply_projection_update(1, &stale_epoch, ProjectionUpdate::Current(current.clone()))
-            .await;
-        assert!(manager.projection.lock().await.current.is_none());
-        manager
-            .apply_projection_update(2, &stale_epoch, ProjectionUpdate::Current(current.clone()))
-            .await;
-        assert!(manager.projection.lock().await.current.is_none());
         manager
             .apply_projection_update(
-                2,
-                &current_epoch,
+                7,
+                &old,
+                &old_epoch,
                 ProjectionUpdate::Current(current.clone()),
             )
             .await;
         assert_eq!(manager.projection.lock().await.current, Some(current));
 
-        let next_generation = manager.begin_projection_attempt().await;
-        assert!(manager.projection.lock().await.current.is_none());
-        assert!(
-            manager
-                .activate_projection(
-                    next_generation,
-                    3,
-                    ClientBindingEpoch::from_random_bytes([0x33; 32]),
-                    silent_channel(),
-                )
-                .await
-        );
+        assert!(manager
+            .status_auth_proof(7, "challenge-old", "ws://wrong/", author)
+            .await
+            .is_err());
+        assert!(manager.projection.lock().await.current.is_some());
+
+        let new_epoch = test_epoch(0x22);
+        let new = test_handle(Some(test_status_scope(
+            generation,
+            relay,
+            author,
+            new_epoch.clone(),
+        )));
+        manager.connections.lock().await.insert(7, new.clone());
+        manager
+            .record_status_challenge(7, &new, "challenge-new")
+            .await;
+        let new_proof = manager
+            .status_auth_proof(7, "challenge-new", "ws://localhost:3000/", author)
+            .await
+            .expect("replacement proof");
+        manager
+            .complete_status_auth(7, &new_proof)
+            .await
+            .expect("replacement owns projection");
+        manager.clear_projection_if_owner(7, &old, &old_epoch).await;
         manager
             .apply_projection_update(
-                2,
-                &current_epoch,
+                7,
+                &old,
+                &old_epoch,
                 ProjectionUpdate::Current(CurrentProjection {
-                    event_author_pubkey: "22".repeat(32),
+                    event_author_pubkey: "11".repeat(32),
                     fresh_until: u64::MAX,
-                    connection_epoch: current_epoch.as_str().to_owned(),
+                    connection_epoch: old_epoch.as_str().to_owned(),
                 }),
             )
             .await;
         assert!(manager.projection.lock().await.current.is_none());
+
+        let read_only = test_handle(None);
+        manager
+            .connections
+            .lock()
+            .await
+            .insert(8, read_only.clone());
+        assert!(manager
+            .status_auth_proof(8, "challenge", "ws://localhost:3000/", author)
+            .await
+            .is_err());
+
+        manager.invalidate_projection().await;
+        assert!(new.cancel.is_cancelled());
+        assert!(manager.projection.lock().await.owner.is_none());
+        assert!(manager.complete_status_auth(7, &new_proof).await.is_err());
+        manager.suspend_projection().await;
+        assert!(manager.status_generation().await.is_none());
     }
 
     #[tokio::test]
@@ -1040,12 +1344,14 @@ mod tests {
             sender: old_sender,
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
+            status_scope: Mutex::new(None),
         });
         let (new_sender, _new_receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let current = Arc::new(ConnectionHandle {
             sender: new_sender,
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
+            status_scope: Mutex::new(None),
         });
         manager.connections.lock().await.insert(9, old.clone());
         manager.connections.lock().await.insert(9, current.clone());
@@ -1062,7 +1368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_frames_are_swallowed_without_an_eligible_session() {
+    async fn reserved_text_is_swallowed_but_binary_remains_raw_delivery() {
         let manager = WebSocketManager::default();
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_for_channel = delivered.clone();
@@ -1080,6 +1386,7 @@ mod tests {
             sender,
             cancel: CancellationToken::new(),
             task: Mutex::new(None),
+            status_scope: Mutex::new(None),
         });
         manager.connections.lock().await.insert(42, handle.clone());
         let task = tauri::async_runtime::spawn(run_connection(
@@ -1130,9 +1437,29 @@ mod tests {
             .expect("connection task joins");
         assert_eq!(
             delivered.load(Ordering::SeqCst),
-            2,
-            "only the ordinary text and terminal close reach raw delivery"
+            3,
+            "binary, ordinary text, and terminal close reach raw delivery"
         );
         assert!(!manager.connections.lock().await.contains_key(&42));
+    }
+
+    #[test]
+    fn reserved_classifier_never_intercepts_binary() {
+        let reserved =
+            serde_json::json!(["EVENT", CLIENT_BINDING_STATUS_SUB_ID, "malformed"]).to_string();
+        assert!(reserved_text_message(&Message::Text(reserved.clone().into())).is_some());
+        assert!(reserved_text_message(&Message::Binary(reserved.into_bytes().into())).is_none());
+    }
+
+    #[test]
+    fn auth_challenge_recording_requires_exact_frame_shape() {
+        assert_eq!(
+            nip42_challenge(&serde_json::json!(["AUTH", "exact"]).to_string()).as_deref(),
+            Some("exact")
+        );
+        assert!(
+            nip42_challenge(&serde_json::json!(["AUTH", "exact", "extra"]).to_string()).is_none()
+        );
+        assert!(nip42_challenge("not-json").is_none());
     }
 }

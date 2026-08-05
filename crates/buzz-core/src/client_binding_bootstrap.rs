@@ -38,15 +38,6 @@ impl ClientBindingEpoch {
         Self(Uuid::new_v4().to_string())
     }
 
-    /// Construct a canonical UUIDv4 epoch from caller-supplied CSPRNG bytes.
-    pub fn from_random_bytes(bytes: [u8; 32]) -> Self {
-        let mut uuid_bytes = [0_u8; 16];
-        uuid_bytes.copy_from_slice(&bytes[..16]);
-        uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40;
-        uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
-        Self(Uuid::from_bytes(uuid_bytes).to_string())
-    }
-
     /// Parse the canonical lowercase hyphenated UUIDv4 wire form.
     pub fn parse(value: &str) -> Result<Self, ClientBindingBootstrapError> {
         let parsed = Uuid::parse_str(value)
