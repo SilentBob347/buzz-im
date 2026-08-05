@@ -2014,6 +2014,7 @@ mod tests {
             ),
             remote_addr: "127.0.0.1:1234".parse().unwrap(),
             corporate_identity_assertion: None,
+            client_binding_epoch: None,
             auth_state: RwLock::new(AuthState::Failed),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             send_tx: tx.clone(),

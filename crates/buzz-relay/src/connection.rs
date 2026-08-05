@@ -16,6 +16,7 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use buzz_auth::{generate_challenge, ConnectionAuthContext, LimitType};
+use buzz_core::client_binding_bootstrap::ClientBindingEpoch;
 use buzz_core::tenant::TenantContext;
 use nostr::Filter;
 
@@ -285,6 +286,8 @@ pub struct ConnectionState {
     pub remote_addr: SocketAddr,
     /// Optional direct identity assertion captured with verified provenance.
     pub corporate_identity_assertion: Option<crate::corporate_identity::IdentityAssertionInput>,
+    /// Optional native-generated epoch accepted from the WebSocket upgrade.
+    pub client_binding_epoch: Option<ClientBindingEpoch>,
     /// Current NIP-42 authentication state.
     pub auth_state: RwLock<AuthState>,
     /// Active subscriptions keyed by subscription ID.
@@ -383,6 +386,7 @@ pub async fn handle_connection(
     addr: SocketAddr,
     tenant: TenantContext,
     corporate_identity_assertion: Option<crate::corporate_identity::IdentityAssertionInput>,
+    client_binding_epoch: Option<ClientBindingEpoch>,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -405,6 +409,7 @@ pub async fn handle_connection(
                 conn_id,
                 cancel,
                 corporate_identity_assertion,
+                client_binding_epoch,
             )
         },
     )
@@ -419,6 +424,7 @@ async fn handle_active_connection(
     conn_id: Uuid,
     cancel: CancellationToken,
     corporate_identity_assertion: Option<crate::corporate_identity::IdentityAssertionInput>,
+    client_binding_epoch: Option<ClientBindingEpoch>,
 ) {
     let permit = match state.conn_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -443,6 +449,7 @@ async fn handle_active_connection(
         tenant,
         remote_addr: addr,
         corporate_identity_assertion,
+        client_binding_epoch,
         auth_state: RwLock::new(AuthState::Pending {
             challenge: challenge.clone(),
         }),

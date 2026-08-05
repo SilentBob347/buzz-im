@@ -27,6 +27,7 @@ use crate::connection::handle_connection;
 use crate::metrics::track_metrics;
 use crate::nip11::{nip11_document, relay_info_handler};
 use crate::state::AppState;
+use buzz_core::client_binding_bootstrap::{ClientBindingEpoch, CLIENT_BINDING_EPOCH_HEADER};
 
 /// Build the axum [`Router`] with all relay routes, middleware, and CORS configuration.
 ///
@@ -358,6 +359,13 @@ async fn nip11_or_ws_handler(
         return Json(nip11_document(&state, raw_host).await).into_response();
     }
 
+    let client_binding_epoch = match client_binding_epoch_from_headers(&headers) {
+        Ok(epoch) => epoch,
+        Err(()) => {
+            return (StatusCode::BAD_REQUEST, "invalid websocket request").into_response();
+        }
+    };
+
     // Row zero: bind the connection to its community from the request host
     // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
     // connection. The host is the authoritative selector; an unmapped host or a
@@ -408,7 +416,14 @@ async fn nip11_or_ws_handler(
             }
             limit_relay_websocket(ws, max_frame_bytes)
                 .on_upgrade(move |socket| {
-                    handle_connection(socket, state, addr, tenant, corporate_identity_assertion)
+                    handle_connection(
+                        socket,
+                        state,
+                        addr,
+                        tenant,
+                        corporate_identity_assertion,
+                        client_binding_epoch,
+                    )
                 })
                 .into_response()
         }
@@ -428,6 +443,23 @@ async fn nip11_or_ws_handler(
             Json(nip11_document(&state, raw_host).await).into_response()
         }
     }
+}
+
+fn client_binding_epoch_from_headers(
+    headers: &HeaderMap,
+) -> Result<Option<ClientBindingEpoch>, ()> {
+    let mut values = headers.get_all(CLIENT_BINDING_EPOCH_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    if value.contains(',') {
+        return Err(());
+    }
+    ClientBindingEpoch::parse(value).map(Some).map_err(|_| ())
 }
 
 fn limit_relay_websocket<F>(

@@ -15,6 +15,9 @@ use axum::extract::ws::Message as WsMessage;
 use buzz_auth::{
     AuthTransport, VerifiedDelegationOutput, VerifiedEvidenceAdapter, VerifiedNostrProof,
 };
+use buzz_core::client_binding_bootstrap::{
+    ClientBindingBootstrapInputV1, CLIENT_BINDING_BOOTSTRAP_SUB_ID,
+};
 use tracing::{debug, info, warn};
 
 use crate::connection::{AuthState, ConnectionState};
@@ -447,19 +450,36 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 Arc::clone(&verified_proof),
                 verified_assertion.clone(),
             );
-            if let (Some(runtime), Some(assertion)) =
-                (state.client_status_runtime().cloned(), verified_assertion)
-            {
-                if let Err(error) = runtime
-                    .present_after_auth(
-                        Arc::clone(&state),
-                        verified_proof,
-                        assertion,
-                        conn_id,
-                        conn.cancel.clone(),
-                    )
-                    .await
-                {
+            if let (Some(runtime), Some(assertion), Some(epoch)) = (
+                state.client_status_runtime().cloned(),
+                verified_assertion,
+                conn.client_binding_epoch.clone(),
+            ) {
+                let bootstrap_queued = ClientBindingBootstrapInputV1::new(
+                    conn.tenant.community(),
+                    pubkey,
+                    epoch,
+                    nostr::Timestamp::now().as_secs(),
+                )
+                .ok()
+                .and_then(|input| input.sign_with_relay_keys(&state.relay_keypair).ok())
+                .is_some_and(|event| {
+                    conn.send(RelayMessage::event(CLIENT_BINDING_BOOTSTRAP_SUB_ID, &event))
+                });
+                let presentation = if bootstrap_queued {
+                    runtime
+                        .present_after_auth(
+                            Arc::clone(&state),
+                            verified_proof,
+                            assertion,
+                            conn_id,
+                            conn.cancel.clone(),
+                        )
+                        .await
+                } else {
+                    Err(crate::authorization_runtime::status::ClientStatusRuntimeError::DeliveryUnavailable)
+                };
+                if let Err(error) = presentation {
                     // Presentation failure never widens or narrows access. The
                     // client receives no current indicator and clears any old
                     // status on its existing freshness/disconnect boundary.
