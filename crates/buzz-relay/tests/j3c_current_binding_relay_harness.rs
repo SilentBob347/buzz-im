@@ -1,10 +1,16 @@
 //! Test-only J3C relay-authenticated client-binding status composition.
 //!
 //! This harness deliberately composes only public production contracts. It
-//! binds a real loopback WebSocket, creates verification-only evidence through
-//! the authorization finalizer, asks the production issuer and exact-connection
-//! transport to deliver, frames that issuer-produced event with the production
-//! relay serializer, and folds it with the production client tracker.
+//! binds a real loopback WebSocket, carries a real NIP-42 `AUTH` frame through
+//! the Buzz parser and verifier, creates verification-only evidence through the
+//! authorization finalizer, and asks the production issuer and exact-connection
+//! transport to deliver. The production J1 native session source consumes the
+//! resulting bootstrap/status frames.
+
+extern crate buzz_core as buzz_core_pkg;
+
+#[path = "../../../desktop/src-tauri/src/client_binding_status_session.rs"]
+mod client_binding_status_session;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -13,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use buzz_auth::context::BindingExpiry;
 use buzz_auth::evidence_adapter::{ActiveBindingResolution, VerifiedEvidenceAdapter};
 use buzz_auth::{
     resolve_authorization, resolve_current_federated_policy, ApplicationLeaseLimit,
@@ -20,13 +27,16 @@ use buzz_auth::{
     AuthorityAdapterFuture, AuthorizationCapability, AuthorizationClock, AuthorizationClockError,
     AuthorizationClockSkew, AuthorizationFinalizer, AuthorizationOutcome, AuthorizationProfileId,
     AuthorizationProvider, AuthorizationProviderFuture, AuthorizationRequest, AuthorizationTime,
-    AuthorizedCommunityAccess, BindingExpiry, BindingLeaseBound, BindingResolutionRequest,
-    BindingSource, BindingVersion, CapabilitySet, CurrentPolicyRequest,
-    CurrentPolicyResolutionSink, DirectBindingResolutionSink, EnrollmentMode,
-    ExistingBindingResolutionSink, FederatedAuthorityAdapter, FederatedAuthorization,
-    FederatedIdentityRequirement, PolicyVersion, ProviderAllow, ProviderAuthorizationClock,
-    ProviderDecision, ProviderTimeout, Scope, VerificationOnlyDisposition,
-    VerificationStatusPolicy,
+    AuthorizedCommunityAccess, BindingLeaseBound, BindingResolutionRequest, BindingSource,
+    BindingVersion, CapabilitySet, CurrentPolicyRequest, CurrentPolicyResolutionSink,
+    DirectBindingResolutionSink, EnrollmentMode, ExistingBindingResolutionSink,
+    FederatedAuthorityAdapter, FederatedAuthorization, FederatedIdentityRequirement, PolicyVersion,
+    ProviderAllow, ProviderAuthorizationClock, ProviderDecision, ProviderTimeout, Scope,
+    VerificationOnlyDisposition, VerificationStatusPolicy, VerifiedNostrProof,
+};
+use buzz_core::client_binding_bootstrap::{
+    ClientBindingBootstrapInputV1, ClientBindingEpoch, CLIENT_BINDING_BOOTSTRAP_SUB_ID,
+    CLIENT_BINDING_EPOCH_HEADER, CLIENT_BINDING_STATUS_SUB_ID,
 };
 use buzz_core::client_binding_status::{
     ClientBindingStatusError, ClientBindingStatusFoldError, ClientBindingStatusInputV1,
@@ -42,19 +52,25 @@ use buzz_relay::authorization_runtime::status::{
     RelayClientBindingStatusIssuer,
 };
 use buzz_relay::connection::OutboundData;
-use buzz_relay::protocol::RelayMessage;
+use buzz_relay::protocol::{ClientMessage, RelayMessage};
 use buzz_relay::state::ConnectionManager;
+use client_binding_status_session::{
+    ClientBindingStatusSession, CurrentProjection, ProjectionUpdate,
+};
 use futures::{SinkExt, StreamExt};
 use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, RelayUrl, Timestamp};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Request as ServerRequest, Response as ServerResponse,
+};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-const STATUS_SUBSCRIPTION: &str = "__buzz_client_binding_status_v1__";
 
 #[derive(Clone)]
 struct FixedClock(u64);
@@ -261,30 +277,12 @@ impl DurableClientStatusRevisionSource for SyntheticRevisions {
 }
 
 async fn verification_only_disposition(
-    relay_url: &str,
     domain: CommunityId,
     author: &Keys,
     now: u64,
+    proof: VerifiedNostrProof,
 ) -> (VerificationOnlyDisposition, ClientStatusPrivacyKey) {
     let adapter = VerifiedEvidenceAdapter::new();
-    let challenge = Uuid::new_v4().to_string();
-    let auth_event = EventBuilder::auth(
-        challenge.clone(),
-        RelayUrl::parse(relay_url).expect("loopback relay URL is valid"),
-    )
-    .sign_with_keys(author)
-    .expect("ephemeral author signs NIP-42 proof");
-    let proof = adapter
-        .verify_nip42(
-            domain,
-            AuthTransport::RelayWebSocket,
-            &auth_event,
-            &challenge,
-            relay_url,
-            None,
-        )
-        .expect("production verifier seals the loopback NIP-42 proof");
-
     let issuer = format!("https://{}.invalid", Uuid::new_v4());
     let subject = Uuid::new_v4().to_string();
     let assertion = adapter
@@ -390,11 +388,10 @@ async fn verification_only_disposition(
     (disposition, privacy_key)
 }
 
-fn register_authenticated_connection(
+fn register_connection(
     connections: &ConnectionManager,
     connection_id: Uuid,
     domain: CommunityId,
-    author: &Keys,
 ) -> (
     mpsc::Receiver<OutboundData>,
     mpsc::Receiver<axum::extract::ws::Message>,
@@ -411,7 +408,6 @@ fn register_authenticated_connection(
         Arc::new(AsyncMutex::new(HashMap::new())),
         3,
     );
-    connections.set_authenticated_pubkey(connection_id, author.public_key().to_bytes().to_vec());
     (rx, ctrl_rx)
 }
 
@@ -451,7 +447,7 @@ async fn receive_status(
     socket: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
-) -> Event {
+) -> (String, Event) {
     let message = timeout(Duration::from_secs(2), socket.next())
         .await
         .expect("loopback status frame must not time out")
@@ -462,23 +458,71 @@ async fn receive_status(
     };
     let envelope: Value = serde_json::from_str(&text).expect("relay frame is JSON");
     assert_eq!(envelope[0], "EVENT");
-    assert_eq!(envelope[1], STATUS_SUBSCRIPTION);
-    Event::from_json(envelope[2].to_string()).expect("relay frame carries a Nostr event")
+    let event =
+        Event::from_json(envelope[2].to_string()).expect("relay frame carries a Nostr event");
+    (text.to_string(), event)
 }
 
-async fn round_trip(
-    sender: &mpsc::UnboundedSender<String>,
+async fn receive_transport_event(
+    expected_frames: &mpsc::UnboundedSender<String>,
     socket: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    subscription: &str,
     event: &Event,
-) -> Event {
-    sender
-        .send(RelayMessage::event(STATUS_SUBSCRIPTION, event))
-        .expect("loopback relay task remains live");
-    let received = receive_status(socket).await;
+) -> (String, Event) {
+    expected_frames
+        .send(RelayMessage::event(subscription, event))
+        .expect("queue-drain adapter remains live");
+    let (text, received) = receive_status(socket).await;
     assert_eq!(received.id, event.id, "wire event must be issuer-produced");
-    received
+    (text, received)
+}
+
+async fn enqueue_and_receive_event(
+    connections: &ConnectionManager,
+    connection_id: Uuid,
+    expected_frames: &mpsc::UnboundedSender<String>,
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    subscription: &str,
+    event: &Event,
+) -> (String, Event) {
+    let frame = RelayMessage::event(subscription, event);
+    expected_frames
+        .send(frame.clone())
+        .expect("queue-drain adapter remains live");
+    assert!(
+        connections.send_to(connection_id, frame),
+        "production ConnectionManager must enqueue the exact-connection frame"
+    );
+    let (text, received) = receive_status(socket).await;
+    assert_eq!(received.id, event.id, "wire event must be sender-produced");
+    (text, received)
+}
+
+fn assert_current_projection(
+    update: Option<ProjectionUpdate>,
+    author: &Keys,
+    epoch: &ClientBindingEpoch,
+    fresh_until: u64,
+) {
+    let Some(ProjectionUpdate::Current(CurrentProjection {
+        event_author_pubkey,
+        fresh_until: projected_fresh_until,
+        connection_epoch,
+    })) = update
+    else {
+        panic!("production J1 session must project current status");
+    };
+    assert_eq!(event_author_pubkey, author.public_key().to_hex());
+    assert_eq!(projected_fresh_until, fresh_until);
+    assert_eq!(connection_epoch, epoch.as_str());
+}
+
+fn assert_clear(update: Option<ProjectionUpdate>) {
+    assert!(matches!(update, Some(ProjectionUpdate::Clear)));
 }
 
 #[tokio::test]
@@ -491,28 +535,6 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
         .expect("loopback listener has an address");
     assert_ne!(address.port(), 0, "OS must allocate a real ephemeral port");
     let relay_url = format!("ws://{address}");
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<String>();
-    let server = tokio::spawn(async move {
-        let (tcp, peer) = listener.accept().await.expect("loopback client connects");
-        assert!(peer.ip().is_loopback(), "harness must remain loopback-only");
-        let mut websocket = tokio_tungstenite::accept_async(tcp)
-            .await
-            .expect("loopback WebSocket upgrades");
-        let mut sent = 0usize;
-        while let Some(frame) = frame_rx.recv().await {
-            websocket
-                .send(Message::Text(frame.into()))
-                .await
-                .expect("loopback status frame sends");
-            sent += 1;
-        }
-        let _ = websocket.close(None).await;
-        sent
-    });
-    let (mut socket, _) = tokio_tungstenite::connect_async(&relay_url)
-        .await
-        .expect("real loopback WebSocket client connects");
-
     let now = Timestamp::now().as_secs();
     let relay = Keys::generate();
     let author = Keys::generate();
@@ -521,8 +543,124 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     let domain = CommunityId::from_uuid(Uuid::new_v4());
     let wrong_domain = CommunityId::from_uuid(Uuid::new_v4());
     let connection_id = Uuid::new_v4();
+    let epoch = ClientBindingEpoch::from_random_bytes(rand::random());
+    let challenge = Uuid::new_v4().to_string();
+    let auth_event = EventBuilder::auth(
+        challenge.clone(),
+        RelayUrl::parse(&relay_url).expect("loopback relay URL is valid"),
+    )
+    .sign_with_keys(&author)
+    .expect("ephemeral author signs NIP-42 proof");
+
+    let connections = Arc::new(ConnectionManager::new());
+    let (mut outbound_rx, _ctrl_rx) = register_connection(&connections, connection_id, domain);
+    let (expected_frame_tx, mut expected_frame_rx) = mpsc::unbounded_channel::<String>();
+    let (epoch_header_tx, epoch_header_rx) = oneshot::channel::<Option<String>>();
+    let (auth_proof_tx, auth_proof_rx) = oneshot::channel::<VerifiedNostrProof>();
+    let server_relay_url = relay_url.clone();
+    let server_challenge = challenge.clone();
+    let server = tokio::spawn(async move {
+        let (tcp, peer) = listener.accept().await.expect("loopback client connects");
+        assert!(peer.ip().is_loopback(), "harness must remain loopback-only");
+        let mut epoch_header_tx = Some(epoch_header_tx);
+        let mut websocket = tokio_tungstenite::accept_hdr_async(
+            tcp,
+            move |request: &ServerRequest, response: ServerResponse| {
+                let value = request
+                    .headers()
+                    .get(CLIENT_BINDING_EPOCH_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                if let Some(sender) = epoch_header_tx.take() {
+                    let _ = sender.send(value);
+                }
+                Ok(response)
+            },
+        )
+        .await
+        .expect("loopback WebSocket upgrades");
+
+        let auth_text = match websocket.next().await {
+            Some(Ok(Message::Text(text))) => text,
+            _ => panic!("first loopback client frame must be text AUTH"),
+        };
+        let ClientMessage::Auth(event) =
+            ClientMessage::parse(&auth_text).expect("Buzz parser accepts real AUTH frame")
+        else {
+            panic!("first loopback client frame must parse as AUTH");
+        };
+        let proof = VerifiedEvidenceAdapter::new()
+            .verify_nip42(
+                domain,
+                AuthTransport::RelayWebSocket,
+                &event,
+                &server_challenge,
+                &server_relay_url,
+                None,
+            )
+            .expect("Buzz verifier seals AUTH received over loopback");
+        auth_proof_tx
+            .send(proof)
+            .expect("test driver awaits verified AUTH evidence");
+
+        let mut sent = 0usize;
+        while let Some(queued) = outbound_rx.recv().await {
+            let frame = expected_frame_rx
+                .recv()
+                .await
+                .expect("each production queue item has one test-visible oracle frame");
+            // `OutboundData::release` is intentionally crate-private. Receiving
+            // and consuming this value proves the production manager/transport
+            // emitted before the test-only adapter sends its matching oracle.
+            drop(queued);
+            websocket
+                .send(Message::Text(frame.into()))
+                .await
+                .expect("queue-gated loopback frame sends");
+            sent += 1;
+        }
+        let _ = websocket.close(None).await;
+        sent
+    });
+
+    let mut request = relay_url
+        .as_str()
+        .into_client_request()
+        .expect("loopback WebSocket request is valid");
+    request.headers_mut().insert(
+        CLIENT_BINDING_EPOCH_HEADER,
+        HeaderValue::from_str(epoch.as_str()).expect("canonical epoch is a valid header"),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("real loopback WebSocket client connects");
+    let received_epoch = epoch_header_rx
+        .await
+        .expect("loopback handshake reports epoch header")
+        .expect("native epoch header is present");
+    assert_eq!(
+        ClientBindingEpoch::parse(&received_epoch).expect("server parses canonical epoch"),
+        epoch
+    );
+    socket
+        .send(Message::Text(
+            json!([
+                "AUTH",
+                serde_json::to_value(&auth_event).expect("AUTH serializes")
+            ])
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("real AUTH frame crosses loopback WebSocket");
+    let proof = auth_proof_rx
+        .await
+        .expect("server returns exact verified AUTH evidence");
+    assert_eq!(proof.actor_pubkey(), author.public_key());
+    connections.set_authenticated_pubkey(connection_id, proof.actor_pubkey().to_bytes().to_vec());
+
     let (disposition, privacy_key) =
-        verification_only_disposition(&relay_url, domain, &author, now).await;
+        verification_only_disposition(domain, &author, now, proof).await;
     let evidence = authoritative_evidence(&disposition, &privacy_key);
     let revisions = SyntheticRevisions::new(10);
     let issuer = RelayClientBindingStatusIssuer::new(&relay, &revisions, &privacy_key);
@@ -531,10 +669,30 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     })
     .expect("test-only complete approval constructs the production gate");
 
-    let connections = Arc::new(ConnectionManager::new());
-    let (_outbound_rx, _ctrl_rx) =
-        register_authenticated_connection(&connections, connection_id, domain, &author);
     let transport = ConnectionManagerClientStatusTransport::new(Arc::clone(&connections));
+
+    let bootstrap =
+        ClientBindingBootstrapInputV1::new(domain, author.public_key(), epoch.clone(), now)
+            .expect("authenticated connection scope creates bootstrap input")
+            .sign_with_relay_keys(&relay)
+            .expect("relay signs exact connection bootstrap");
+    let mut session =
+        ClientBindingStatusSession::new(relay.public_key(), author.public_key(), epoch.clone());
+    let (bootstrap_text, received_bootstrap) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_BOOTSTRAP_SUB_ID,
+        &bootstrap,
+    )
+    .await;
+    assert_eq!(received_bootstrap.id, bootstrap.id);
+    assert!(matches!(
+        session.consume_text(&bootstrap_text, now),
+        Some(ProjectionUpdate::Unchanged)
+    ));
+
     let current_attempt = issuer
         .deliver_verification_only(&permit, &disposition, 1, None, connection_id, &transport)
         .await
@@ -557,7 +715,11 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     // or resolved for another authorization domain.
     let wrong_author_connection = Uuid::new_v4();
     let (_wrong_author_rx, _wrong_author_ctrl_rx) =
-        register_authenticated_connection(&connections, wrong_author_connection, domain, &spoof);
+        register_connection(&connections, wrong_author_connection, domain);
+    connections.set_authenticated_pubkey(
+        wrong_author_connection,
+        spoof.public_key().to_bytes().to_vec(),
+    );
     let wrong_author_attempt = issuer
         .deliver_verification_only(
             &permit,
@@ -572,11 +734,11 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     assert!(wrong_author_attempt.delivery_error().is_some());
 
     let wrong_domain_connection = Uuid::new_v4();
-    let (_wrong_domain_rx, _wrong_domain_ctrl_rx) = register_authenticated_connection(
-        &connections,
+    let (_wrong_domain_rx, _wrong_domain_ctrl_rx) =
+        register_connection(&connections, wrong_domain_connection, wrong_domain);
+    connections.set_authenticated_pubkey(
         wrong_domain_connection,
-        wrong_domain,
-        &author,
+        author.public_key().to_bytes().to_vec(),
     );
     let wrong_domain_attempt = issuer
         .deliver_verification_only(
@@ -592,7 +754,19 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     assert!(wrong_domain_attempt.delivery_error().is_some());
 
     revisions.set(10);
-    let current = round_trip(&frame_tx, &mut socket, current_attempt.event()).await;
+    let (current_text, current) = receive_transport_event(
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        current_attempt.event(),
+    )
+    .await;
+    assert_current_projection(
+        session.consume_text(&current_text, now),
+        &author,
+        &epoch,
+        disposition.expires_at(),
+    );
     let mut tracker =
         ClientBindingStatusTracker::new(relay.public_key(), domain, author.public_key());
     assert_eq!(
@@ -603,7 +777,16 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     assert_eq!(tracker.high_water_revision(), Some(10));
 
     let malformed = raw_signed_event(&relay, KIND_CLIENT_BINDING_STATUS, "{".to_string(), now);
-    let malformed = round_trip(&frame_tx, &mut socket, &malformed).await;
+    let (malformed_text, malformed) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &malformed,
+    )
+    .await;
+    assert_clear(session.consume_text(&malformed_text, now));
     assert_eq!(
         tracker.accept(&malformed, now),
         Err(ClientBindingStatusFoldError::InvalidStatus(
@@ -620,7 +803,16 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
         unsupported_content.to_string(),
         now,
     );
-    let unsupported = round_trip(&frame_tx, &mut socket, &unsupported).await;
+    let (unsupported_text, unsupported) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &unsupported,
+    )
+    .await;
+    assert_clear(session.consume_text(&unsupported_text, now));
     assert_eq!(
         tracker.accept(&unsupported, now),
         Err(ClientBindingStatusFoldError::InvalidStatus(
@@ -641,7 +833,19 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     .expect("bounded wrong-relay status input")
     .sign_with_relay_keys(&wrong_relay)
     .expect("wrong relay still produces an authenticated Nostr event");
-    let wrong_signer = round_trip(&frame_tx, &mut socket, &wrong_signer).await;
+    let (wrong_signer_text, wrong_signer) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &wrong_signer,
+    )
+    .await;
+    assert!(matches!(
+        session.consume_text(&wrong_signer_text, now),
+        Some(ProjectionUpdate::Unchanged)
+    ));
     assert_eq!(
         tracker.accept(&wrong_signer, now),
         Err(ClientBindingStatusFoldError::InvalidStatus(
@@ -662,7 +866,16 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     .expect("bounded mismatched-author status input")
     .sign_with_relay_keys(&relay)
     .expect("relay signs explicit mismatched-author test event");
-    let author_mismatch = round_trip(&frame_tx, &mut socket, &author_mismatch).await;
+    let (author_mismatch_text, author_mismatch) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &author_mismatch,
+    )
+    .await;
+    assert_clear(session.consume_text(&author_mismatch_text, now));
     assert_eq!(
         tracker.accept(&author_mismatch, now),
         Err(ClientBindingStatusFoldError::InvalidStatus(
@@ -683,7 +896,16 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     .expect("bounded mismatched-domain status input")
     .sign_with_relay_keys(&relay)
     .expect("relay signs explicit mismatched-domain test event");
-    let domain_mismatch = round_trip(&frame_tx, &mut socket, &domain_mismatch).await;
+    let (domain_mismatch_text, domain_mismatch) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &domain_mismatch,
+    )
+    .await;
+    assert_clear(session.consume_text(&domain_mismatch_text, now));
     assert_eq!(
         tracker.accept(&domain_mismatch, now),
         Err(ClientBindingStatusFoldError::InvalidStatus(
@@ -693,21 +915,41 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
 
     // Neither mutable profile metadata nor a legacy NIP-85 assertion can
     // restore or rename the relay-authenticated status presentation.
-    for legacy in [
-        raw_signed_event(
-            &spoof,
-            Kind::Metadata.as_u16() as u32,
-            json!({"name": format!("spoof-{}", Uuid::new_v4())}).to_string(),
-            now,
+    for (legacy, expected_clear) in [
+        (
+            raw_signed_event(
+                &spoof,
+                Kind::Metadata.as_u16() as u32,
+                json!({"name": format!("spoof-{}", Uuid::new_v4())}).to_string(),
+                now,
+            ),
+            false,
         ),
-        raw_signed_event(
-            &relay,
-            KIND_USER_TRUSTED_ASSERTION,
-            json!({"active": true, "label": format!("legacy-{}", Uuid::new_v4())}).to_string(),
-            now,
+        (
+            raw_signed_event(
+                &relay,
+                KIND_USER_TRUSTED_ASSERTION,
+                json!({"active": true, "label": format!("legacy-{}", Uuid::new_v4())}).to_string(),
+                now,
+            ),
+            true,
         ),
     ] {
-        let legacy = round_trip(&frame_tx, &mut socket, &legacy).await;
+        let (legacy_text, legacy) = enqueue_and_receive_event(
+            &connections,
+            connection_id,
+            &expected_frame_tx,
+            &mut socket,
+            CLIENT_BINDING_STATUS_SUB_ID,
+            &legacy,
+        )
+        .await;
+        let update = session.consume_text(&legacy_text, now);
+        if expected_clear {
+            assert_clear(update);
+        } else {
+            assert!(matches!(update, Some(ProjectionUpdate::Unchanged)));
+        }
         assert_eq!(
             tracker.accept(&legacy, now),
             Err(ClientBindingStatusFoldError::InvalidStatus(
@@ -733,7 +975,14 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
         )
         .await
         .expect("production issuer delivers a strictly newer withdrawal");
-    let withdrawal = round_trip(&frame_tx, &mut socket, &withdrawal).await;
+    let (withdrawal_text, withdrawal) = receive_transport_event(
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &withdrawal,
+    )
+    .await;
+    assert_clear(session.consume_text(&withdrawal_text, now));
     assert_eq!(
         tracker.accept(&withdrawal, now),
         Ok(ClientBindingStatusUpdate::Accepted)
@@ -761,19 +1010,89 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     .expect("equal-revision conflict input is structurally valid")
     .sign_with_relay_keys(&relay)
     .expect("relay signs explicit conflict event");
-    let equal_conflict = round_trip(&frame_tx, &mut socket, &equal_conflict).await;
+    let (equal_conflict_text, equal_conflict) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &equal_conflict,
+    )
+    .await;
+    assert_clear(session.consume_text(&equal_conflict_text, now));
     assert_eq!(
         tracker.accept(&equal_conflict, now),
         Err(ClientBindingStatusFoldError::ConflictingEqualRevision)
     );
 
-    revisions.set(12);
+    // A trusted relay event in a malformed reserved outer frame must clear and
+    // consume its revision. Replaying the same event in an exact frame cannot
+    // restore; only a strictly newer issuer event may do so (J1 fail-closed
+    // high-water latch).
+    let trusted_invalid_current = ClientBindingStatusInputV1::current(
+        domain,
+        author.public_key(),
+        8,
+        "opaque-trusted-invalid",
+        12,
+        now,
+        disposition.expires_at(),
+        None,
+    )
+    .expect("trusted-invalid inner status is structurally valid")
+    .sign_with_relay_keys(&relay)
+    .expect("trusted relay signs inner status");
+    let trusted_invalid_frame = json!([
+        "EVENT",
+        CLIENT_BINDING_STATUS_SUB_ID,
+        serde_json::to_value(&trusted_invalid_current).expect("status serializes"),
+        {"unexpected": true}
+    ])
+    .to_string();
+    expected_frame_tx
+        .send(trusted_invalid_frame.clone())
+        .expect("queue-drain adapter remains live");
+    assert!(connections.send_to(connection_id, trusted_invalid_frame));
+    let (trusted_invalid_text, received_trusted_invalid) = receive_status(&mut socket).await;
+    assert_eq!(received_trusted_invalid.id, trusted_invalid_current.id);
+    assert_clear(session.consume_text(&trusted_invalid_text, now));
+    assert_eq!(session.projected_fresh_until(), None);
+
+    let (equal_replay_text, equal_replay) = enqueue_and_receive_event(
+        &connections,
+        connection_id,
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        &trusted_invalid_current,
+    )
+    .await;
+    assert_eq!(equal_replay.id, trusted_invalid_current.id);
+    assert!(matches!(
+        session.consume_text(&equal_replay_text, now),
+        Some(ProjectionUpdate::Unchanged)
+    ));
+    assert_eq!(session.projected_fresh_until(), None);
+
+    revisions.set(13);
     let restored_attempt = issuer
         .deliver_verification_only(&permit, &disposition, 1, None, connection_id, &transport)
         .await
         .expect("production issuer creates strictly newer restoration");
     assert_eq!(restored_attempt.delivery_error(), None);
-    let restored = round_trip(&frame_tx, &mut socket, restored_attempt.event()).await;
+    let (restored_text, restored) = receive_transport_event(
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        restored_attempt.event(),
+    )
+    .await;
+    assert_current_projection(
+        session.consume_text(&restored_text, now),
+        &author,
+        &epoch,
+        disposition.expires_at(),
+    );
     assert_eq!(
         tracker.accept(&restored, now),
         Ok(ClientBindingStatusUpdate::Accepted)
@@ -782,7 +1101,7 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
 
     tracker.on_disconnect();
     assert!(tracker.current_presentation(now).is_none());
-    assert_eq!(tracker.high_water_revision(), Some(12));
+    assert_eq!(tracker.high_water_revision(), Some(13));
     assert_eq!(
         tracker.accept(&restored, now),
         Ok(ClientBindingStatusUpdate::Duplicate),
@@ -790,12 +1109,32 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     );
     assert!(tracker.current_presentation(now).is_none());
 
-    revisions.set(13);
+    assert_clear(Some(session.disconnect()));
+    assert_eq!(session.projected_fresh_until(), None);
+    assert!(matches!(
+        session.consume_text(&restored_text, now),
+        Some(ProjectionUpdate::Unchanged)
+    ));
+    assert_eq!(session.projected_fresh_until(), None);
+
+    revisions.set(14);
     let reconnect_attempt = issuer
         .deliver_verification_only(&permit, &disposition, 2, None, connection_id, &transport)
         .await
         .expect("reconnect obtains a newer production issuance");
-    let reconnect = round_trip(&frame_tx, &mut socket, reconnect_attempt.event()).await;
+    let (reconnect_text, reconnect) = receive_transport_event(
+        &expected_frame_tx,
+        &mut socket,
+        CLIENT_BINDING_STATUS_SUB_ID,
+        reconnect_attempt.event(),
+    )
+    .await;
+    assert_current_projection(
+        session.consume_text(&reconnect_text, now),
+        &author,
+        &epoch,
+        disposition.expires_at(),
+    );
     assert_eq!(
         tracker.accept(&reconnect, now),
         Ok(ClientBindingStatusUpdate::Accepted)
@@ -804,7 +1143,9 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     assert!(tracker
         .current_presentation(disposition.expires_at())
         .is_none());
-    assert_eq!(tracker.high_water_revision(), Some(13));
+    assert_eq!(tracker.high_water_revision(), Some(14));
+    assert_clear(Some(session.expire(disposition.expires_at())));
+    assert_eq!(session.projected_fresh_until(), None);
 
     tracker.change_scope(relay.public_key(), wrong_domain, author.public_key());
     assert_eq!(tracker.high_water_revision(), None);
@@ -822,6 +1163,9 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
         ClientBindingStatusTracker::new(relay.public_key(), domain, author.public_key());
     assert!(restarted.current_presentation(now).is_none());
     assert_eq!(restarted.high_water_revision(), None);
+    let restarted_session =
+        ClientBindingStatusSession::new(relay.public_key(), author.public_key(), epoch.clone());
+    assert_eq!(restarted_session.projected_fresh_until(), None);
 
     assert_eq!(revisions.current_reads.load(Ordering::SeqCst), 5);
     assert_eq!(revisions.withdrawal_reads.load(Ordering::SeqCst), 1);
@@ -838,43 +1182,17 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     }));
     drop(observed_scopes);
 
-    drop(frame_tx);
+    connections.deregister(connection_id);
+    drop(expected_frame_tx);
     let sent = server.await.expect("loopback relay task exits cleanly");
     assert!(
-        sent >= 12,
-        "non-vacuity: all status cases crossed WebSocket"
+        sent >= 15,
+        "non-vacuity: AUTH/bootstrap/status cases crossed queue-gated WebSocket"
     );
 }
 
 #[test]
-fn composition_is_test_only_and_stock_production_remains_unwired() {
-    const HARNESS: &str = include_str!("j3c_current_binding_relay_harness.rs");
-    const MAIN: &str = include_str!("../src/main.rs");
-    const LIB: &str = include_str!("../src/lib.rs");
-    const ROUTER: &str = include_str!("../src/router.rs");
-    const STATE: &str = include_str!("../src/state.rs");
-
-    assert!(file!().contains("/tests/") || file!().starts_with("tests/"));
-    for required in [
-        "TcpListener::bind(\"127.0.0.1:0\")",
-        "RelayClientBindingStatusIssuer::new",
-        "ConnectionManagerClientStatusTransport::new",
-        "ClientBindingStatusTracker::new",
-        "RelayMessage::event",
-    ] {
-        assert!(
-            HARNESS.contains(required),
-            "missing non-vacuity seam: {required}"
-        );
-    }
-    for production_root in [MAIN, LIB, ROUTER, STATE] {
-        assert!(!production_root.contains("CompleteSyntheticApproval"));
-        assert!(!production_root.contains("SyntheticRevisions"));
-        assert!(!production_root.contains("j3c_current_binding_relay_harness"));
-        assert!(!production_root.contains("ProductionClientStatusRuntime::new"));
-        assert!(!production_root.contains("ClientStatusPresentationPermit::from_complete_stack"));
-    }
-
+fn presentation_gate_rejects_incomplete_review_evidence() {
     let incomplete = CompleteSyntheticApproval {
         reviewed_revision: "not-a-revision".to_string(),
     };
