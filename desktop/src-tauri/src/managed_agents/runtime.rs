@@ -22,7 +22,8 @@ pub(crate) use path::should_use_inherited;
 
 mod metadata;
 pub(crate) use metadata::{
-    resolve_session_title, runtime_metadata_env_vars, SESSION_TITLE_ENV_VAR,
+    apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
+    DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
 };
 
 mod stop;
@@ -702,12 +703,9 @@ pub fn spawn_agent_child(
             );
         }
     }
-    // Only emit BUZZ_ACP_IDLE_TIMEOUT when the user has explicitly set an
-    // override. When unset, the buzz-acp harness applies its own default
-    // (see `DEFAULT_IDLE_TIMEOUT_SECS` in crates/buzz-acp/src/config.rs),
-    // which is the single source of truth. The previously-emitted
-    // `BUZZ_ACP_TURN_TIMEOUT` is deprecated upstream and was pinning every
-    // agent to the desktop's stale default (320s), bypassing harness bumps.
+    // Emit BUZZ_ACP_IDLE_TIMEOUT only when explicitly set; the harness
+    // DEFAULT_IDLE_TIMEOUT_SECS is the single source of truth. The deprecated
+    // BUZZ_ACP_TURN_TIMEOUT pinned agents to a stale default (320s).
     if let Some(idle) = record.idle_timeout_seconds {
         command.env("BUZZ_ACP_IDLE_TIMEOUT", idle.to_string());
     }
@@ -715,7 +713,8 @@ pub fn spawn_agent_child(
     if let Some(max_dur) = record.max_turn_duration_seconds {
         command.env("BUZZ_ACP_MAX_TURN_DURATION", max_dur.to_string());
     }
-    command.env("BUZZ_ACP_AGENTS", record.parallelism.to_string());
+    let acp_n = super::acp_agents_value(effective_command, record.parallelism);
+    command.env("BUZZ_ACP_AGENTS", acp_n);
     command.env("BUZZ_ACP_MULTIPLE_EVENT_HANDLING", "steer");
     command.env("BUZZ_ACP_DEDUP", "queue");
     if let Some(meta) = runtime_meta {
@@ -763,11 +762,10 @@ pub fn spawn_agent_child(
     // is display metadata only. The spawn-config snapshot records the same
     // resolve, so a rename raises the restart badge instead of leaving the
     // process stale.
-    if let Some(title) = resolve_session_title(record.display_name.as_deref(), &record.name) {
-        command.env(SESSION_TITLE_ENV_VAR, title);
-    } else {
-        command.env_remove(SESSION_TITLE_ENV_VAR);
-    }
+    apply_agent_display_env(
+        &mut command,
+        resolve_session_title(record.display_name.as_deref(), &record.name),
+    );
     build_buzz_agent_provider_defaults(&mut command);
     if let Some(meta) = runtime_meta {
         for (key, value) in runtime_metadata_env_vars(

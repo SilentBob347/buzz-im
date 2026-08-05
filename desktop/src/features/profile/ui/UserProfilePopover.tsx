@@ -62,6 +62,8 @@ type UserProfilePopoverProps = {
   triggerAriaLabel?: string;
   /** Set false when the trigger is inside another interactive control. */
   enableProfilePanel?: boolean;
+  /** Set false when a smaller, context-specific hover treatment is provided. */
+  enableHoverPopover?: boolean;
   /** When set to "bot", a BotIdenticon badge renders next to the display name. */
   role?: string;
   /** Value used to generate the BotIdenticon glyph (typically the author name). */
@@ -176,6 +178,7 @@ export function UserProfilePopover({
   triggerElement = "div",
   triggerAriaLabel,
   enableProfilePanel = true,
+  enableHoverPopover = true,
   role,
   botIdenticonValue,
 }: UserProfilePopoverProps) {
@@ -305,11 +308,14 @@ export function UserProfilePopover({
   }, []);
 
   const handleTriggerMouseEnter = React.useCallback(() => {
+    if (!enableHoverPopover) {
+      return;
+    }
     clearHoverTimer();
     hoverTimerRef.current = setTimeout(() => {
       setOpen(true);
     }, HOVER_OPEN_DELAY_MS);
-  }, [clearHoverTimer]);
+  }, [clearHoverTimer, enableHoverPopover]);
 
   const handleMouseLeave = React.useCallback(() => {
     clearHoverTimer();
