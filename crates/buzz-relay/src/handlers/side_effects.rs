@@ -2524,16 +2524,9 @@ async fn handle_git_repo_announcement(
     if state.is_protected_enforcing(tenant.community()) {
         return Ok(());
     }
-    // The transaction share-lock spans both the name reservation and the
-    // object-store pointer write. Cutover takes the conflicting row lock, so
-    // it cannot enter `importing` while a final legacy publication is in flight.
-    let legacy_visibility = state
-        .db
-        .begin_legacy_visibility_write(
-            tenant.community(),
-            buzz_db::protected_visibility::ProtectedObjectSurface::Git,
-        )
-        .await?;
+    // The ingest caller holds the legacy visibility transaction across event
+    // persistence and this pointer write. Acquiring a second guard here can
+    // exhaust the pool when announcements are processed concurrently.
     crate::api::git::migration::require_legacy_sentinel_absent(state, tenant).await?;
     // Extract repo identifier from d tag (required for NIP-33 parameterized replaceable events).
     let repo_id =
@@ -2679,8 +2672,6 @@ async fn handle_git_repo_announcement(
             "failed to ensure manifest pointer: {pointer_err}"
         ));
     }
-    legacy_visibility.commit().await?;
-
     info!(
         repo_id = %repo_id,
         reserved = reserved_by_this_attempt,
