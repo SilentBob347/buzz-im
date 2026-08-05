@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{kind::KIND_CLIENT_BINDING_BOOTSTRAP, verify_event, CommunityId};
+use crate::{
+    client_binding_status::MAX_CLIENT_BINDING_STATUS_LIFETIME_SECS,
+    kind::KIND_CLIENT_BINDING_BOOTSTRAP, verify_event, CommunityId,
+};
 
-/// WebSocket upgrade header carrying a native-generated connection epoch.
-pub const CLIENT_BINDING_EPOCH_HEADER: &str = "x-buzz-client-binding-epoch-v1";
+/// Integrity-protected NIP-42 tag carrying the native connection scope.
+pub const CLIENT_BINDING_SCOPE_TAG: &str = "buzz_client_binding_scope";
 /// Reserved exact-connection subscription id for bootstrap delivery.
 pub const CLIENT_BINDING_BOOTSTRAP_SUB_ID: &str = "__buzz_client_binding_bootstrap_v1__";
 /// Reserved exact-connection subscription id for status delivery.
@@ -25,31 +28,95 @@ pub const CLIENT_BINDING_BOOTSTRAP_VERSION: u64 = 1;
 /// Maximum encoded bootstrap payload length.
 pub const MAX_CLIENT_BINDING_BOOTSTRAP_PAYLOAD_BYTES: usize = 1024;
 
-/// Opaque, native-generated 256-bit connection epoch.
+/// Opaque, native-generated canonical lowercase UUIDv4 connection epoch.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ClientBindingEpoch(String);
 
 impl ClientBindingEpoch {
-    /// Construct an epoch from 32 CSPRNG bytes.
-    pub fn from_random_bytes(bytes: [u8; 32]) -> Self {
-        Self(hex::encode(bytes))
+    /// Generate a fresh connection epoch from the operating system CSPRNG.
+    pub fn new_v4() -> Self {
+        Self(Uuid::new_v4().to_string())
     }
 
-    /// Parse the canonical 64-character lowercase hexadecimal wire form.
+    /// Construct a canonical UUIDv4 epoch from caller-supplied CSPRNG bytes.
+    pub fn from_random_bytes(bytes: [u8; 32]) -> Self {
+        let mut uuid_bytes = [0_u8; 16];
+        uuid_bytes.copy_from_slice(&bytes[..16]);
+        uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40;
+        uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(uuid_bytes).to_string())
+    }
+
+    /// Parse the canonical lowercase hyphenated UUIDv4 wire form.
     pub fn parse(value: &str) -> Result<Self, ClientBindingBootstrapError> {
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        let parsed = Uuid::parse_str(value)
+            .map_err(|_| ClientBindingBootstrapError::InvalidConnectionEpoch)?;
+        let bytes = parsed.as_bytes();
+        if parsed.to_string() != value || (bytes[6] >> 4) != 4 || (bytes[8] >> 6) != 2 {
             return Err(ClientBindingBootstrapError::InvalidConnectionEpoch);
         }
         Ok(Self(value.to_owned()))
     }
 
-    /// Canonical header and payload representation.
+    /// Canonical payload and signed-tag representation.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Verified native connection scope carried by one signed NIP-42 AUTH event.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientBindingScopeV1 {
+    connection_epoch: ClientBindingEpoch,
+    relay_signer: PublicKey,
+}
+
+impl ClientBindingScopeV1 {
+    /// Parse exactly one canonical v1 scope tag from a verified AUTH event.
+    ///
+    /// This parser does not authenticate the event. Callers must invoke it only
+    /// after the ordinary NIP-42 signature, challenge, and relay checks pass.
+    pub fn from_verified_auth_event(event: &Event) -> Result<Self, ClientBindingBootstrapError> {
+        let mut matching = event.tags.iter().filter(|tag| {
+            tag.as_slice().first().map(String::as_str) == Some(CLIENT_BINDING_SCOPE_TAG)
+        });
+        let tag = matching
+            .next()
+            .ok_or(ClientBindingBootstrapError::MissingScopeTag)?;
+        if matching.next().is_some() {
+            return Err(ClientBindingBootstrapError::DuplicateScopeTag);
+        }
+        let values = tag.as_slice();
+        if values.len() != 4 || values[1] != "1" {
+            return Err(ClientBindingBootstrapError::InvalidScopeTag);
+        }
+        let connection_epoch = ClientBindingEpoch::parse(&values[2])?;
+        let relay_signer = parse_canonical_pubkey(&values[3])
+            .map_err(|_| ClientBindingBootstrapError::InvalidScopeTag)?;
+        Ok(Self {
+            connection_epoch,
+            relay_signer,
+        })
+    }
+
+    /// Native-generated epoch authenticated by the NIP-42 event signature.
+    pub fn connection_epoch(&self) -> &ClientBindingEpoch {
+        &self.connection_epoch
+    }
+
+    /// NIP-11 relay signer pinned by native before the socket was opened.
+    pub const fn relay_signer(&self) -> PublicKey {
+        self.relay_signer
+    }
+}
+
+impl fmt::Debug for ClientBindingScopeV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientBindingScopeV1")
+            .field("connection_epoch", &"[redacted]")
+            .field("relay_signer", &"[redacted]")
+            .finish()
     }
 }
 
@@ -239,6 +306,9 @@ pub fn validate_client_binding_bootstrap_event(
     if wire.issued_at > now {
         return Err(ClientBindingBootstrapError::NotYetValid);
     }
+    if now - wire.issued_at > MAX_CLIENT_BINDING_STATUS_LIFETIME_SECS {
+        return Err(ClientBindingBootstrapError::Expired);
+    }
     Ok(ClientBindingBootstrapV1 {
         authorization_domain: CommunityId::from_uuid(authorization_domain),
         event_author_pubkey,
@@ -262,6 +332,15 @@ fn parse_canonical_pubkey(value: &str) -> Result<PublicKey, ClientBindingBootstr
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ClientBindingBootstrapError {
+    /// The verified AUTH event did not opt into native status projection.
+    #[error("client binding scope tag is missing")]
+    MissingScopeTag,
+    /// More than one connection scope tag was present.
+    #[error("client binding scope tag is duplicated")]
+    DuplicateScopeTag,
+    /// The signed connection scope tag was not the exact canonical v1 shape.
+    #[error("client binding scope tag is invalid")]
+    InvalidScopeTag,
     /// Event kind was not the dedicated bootstrap kind.
     #[error("client binding bootstrap event has the wrong kind")]
     WrongKind,
@@ -295,7 +374,7 @@ pub enum ClientBindingBootstrapError {
     /// Connection epoch was noncanonical.
     #[error("client binding bootstrap connection epoch is invalid")]
     InvalidConnectionEpoch,
-    /// Echoed epoch did not match the native upgrade header.
+    /// Echoed epoch did not match the native signed NIP-42 scope.
     #[error("client binding bootstrap connection epoch does not match")]
     ConnectionEpochMismatch,
     /// Issue time was zero.
@@ -307,6 +386,9 @@ pub enum ClientBindingBootstrapError {
     /// Bootstrap claims a future issue time.
     #[error("client binding bootstrap is not yet valid")]
     NotYetValid,
+    /// Bootstrap exceeded the client-status maximum lifetime.
+    #[error("client binding bootstrap has expired")]
+    Expired,
 }
 
 /// Bootstrap serialization or signing failure.
@@ -326,7 +408,7 @@ pub enum ClientBindingBootstrapBuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::JsonUtil;
+    use nostr::{JsonUtil, Tag};
     use serde_json::{json, Value};
 
     const DOMAIN: &str = "abcdefab-cdef-4abc-8def-abcdefabcdef";
@@ -337,7 +419,8 @@ mod tests {
     }
 
     fn epoch(byte: u8) -> ClientBindingEpoch {
-        ClientBindingEpoch::from_random_bytes([byte; 32])
+        ClientBindingEpoch::parse(&format!("11111111-1111-4111-8111-{byte:012x}"))
+            .expect("synthetic epoch is canonical UUIDv4")
     }
 
     fn signed_bootstrap(relay: &Keys, author: PublicKey) -> Event {
@@ -415,11 +498,15 @@ mod tests {
     #[test]
     fn bootstrap_rejects_noncanonical_epoch_and_invalid_input_bounds() {
         assert_eq!(
-            ClientBindingEpoch::parse(&"A".repeat(64)),
+            ClientBindingEpoch::parse("11111111-1111-4111-8111-AAAAAAAAAAAA"),
             Err(ClientBindingBootstrapError::InvalidConnectionEpoch)
         );
         assert_eq!(
-            ClientBindingEpoch::parse(&"a".repeat(63)),
+            ClientBindingEpoch::parse("11111111-1111-5111-8111-111111111111"),
+            Err(ClientBindingBootstrapError::InvalidConnectionEpoch)
+        );
+        assert_eq!(
+            ClientBindingEpoch::parse("11111111-1111-4111-7111-111111111111"),
             Err(ClientBindingBootstrapError::InvalidConnectionEpoch)
         );
         assert_eq!(
@@ -469,6 +556,16 @@ mod tests {
             validate(&event, &relay, &author, &expected_epoch, ISSUED_AT - 1),
             Err(ClientBindingBootstrapError::NotYetValid)
         );
+        assert_eq!(
+            validate(
+                &event,
+                &relay,
+                &author,
+                &expected_epoch,
+                ISSUED_AT + MAX_CLIENT_BINDING_STATUS_LIFETIME_SECS + 1,
+            ),
+            Err(ClientBindingBootstrapError::Expired)
+        );
 
         let mut tampered_json: Value =
             serde_json::from_str(&event.as_json()).expect("event parses");
@@ -506,6 +603,47 @@ mod tests {
                 ISSUED_AT,
             ),
             Err(ClientBindingBootstrapError::InvalidAuthorizationDomain)
+        );
+    }
+
+    #[test]
+    fn verified_auth_scope_requires_one_exact_signed_tag() {
+        let author = Keys::generate();
+        let relay = Keys::generate();
+        let epoch = epoch(0x11);
+        let scope = vec![
+            CLIENT_BINDING_SCOPE_TAG.to_string(),
+            "1".to_string(),
+            epoch.as_str().to_string(),
+            relay.public_key().to_hex(),
+        ];
+        let auth = EventBuilder::new(Kind::Custom(22242), "")
+            .tags([Tag::parse(scope.clone()).expect("synthetic scope tag")])
+            .sign_with_keys(&author)
+            .expect("synthetic AUTH signs");
+        let parsed = ClientBindingScopeV1::from_verified_auth_event(&auth)
+            .expect("exact signed scope parses");
+        assert_eq!(parsed.connection_epoch(), &epoch);
+        assert_eq!(parsed.relay_signer(), relay.public_key());
+
+        let missing = EventBuilder::new(Kind::Custom(22242), "")
+            .sign_with_keys(&author)
+            .expect("synthetic AUTH signs");
+        assert_eq!(
+            ClientBindingScopeV1::from_verified_auth_event(&missing),
+            Err(ClientBindingBootstrapError::MissingScopeTag)
+        );
+
+        let duplicate = EventBuilder::new(Kind::Custom(22242), "")
+            .tags([
+                Tag::parse(scope.clone()).expect("synthetic scope tag"),
+                Tag::parse(scope).expect("synthetic scope tag"),
+            ])
+            .sign_with_keys(&author)
+            .expect("synthetic AUTH signs");
+        assert_eq!(
+            ClientBindingScopeV1::from_verified_auth_event(&duplicate),
+            Err(ClientBindingBootstrapError::DuplicateScopeTag)
         );
     }
 }

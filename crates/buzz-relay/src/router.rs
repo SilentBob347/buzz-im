@@ -27,7 +27,6 @@ use crate::connection::handle_connection;
 use crate::metrics::track_metrics;
 use crate::nip11::{nip11_document, relay_info_handler};
 use crate::state::AppState;
-use buzz_core::client_binding_bootstrap::{ClientBindingEpoch, CLIENT_BINDING_EPOCH_HEADER};
 
 /// Build the axum [`Router`] with all relay routes, middleware, and CORS configuration.
 ///
@@ -359,13 +358,6 @@ async fn nip11_or_ws_handler(
         return Json(nip11_document(&state, raw_host).await).into_response();
     }
 
-    let client_binding_epoch = match client_binding_epoch_from_headers(&headers) {
-        Ok(epoch) => epoch,
-        Err(()) => {
-            return (StatusCode::BAD_REQUEST, "invalid websocket request").into_response();
-        }
-    };
-
     // Row zero: bind the connection to its community from the request host
     // BEFORE the WebSocket upgrade, so no frame is ever read on an unbound
     // connection. The host is the authoritative selector; an unmapped host or a
@@ -416,14 +408,7 @@ async fn nip11_or_ws_handler(
             }
             limit_relay_websocket(ws, max_frame_bytes)
                 .on_upgrade(move |socket| {
-                    handle_connection(
-                        socket,
-                        state,
-                        addr,
-                        tenant,
-                        corporate_identity_assertion,
-                        client_binding_epoch,
-                    )
+                    handle_connection(socket, state, addr, tenant, corporate_identity_assertion)
                 })
                 .into_response()
         }
@@ -443,23 +428,6 @@ async fn nip11_or_ws_handler(
             Json(nip11_document(&state, raw_host).await).into_response()
         }
     }
-}
-
-fn client_binding_epoch_from_headers(
-    headers: &HeaderMap,
-) -> Result<Option<ClientBindingEpoch>, ()> {
-    let mut values = headers.get_all(CLIENT_BINDING_EPOCH_HEADER).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(());
-    }
-    let value = value.to_str().map_err(|_| ())?;
-    if value.contains(',') {
-        return Err(());
-    }
-    ClientBindingEpoch::parse(value).map(Some).map_err(|_| ())
 }
 
 fn limit_relay_websocket<F>(
@@ -762,38 +730,5 @@ mod tests {
             !handler_receives_message_with_limit(limit, limit + 1).await,
             "oversized messages must be rejected by the WebSocket parser before the handler sees them"
         );
-    }
-
-    #[test]
-    fn client_binding_epoch_header_is_absent_or_one_exact_canonical_value() {
-        let epoch = "11".repeat(32);
-        let mut headers = HeaderMap::new();
-        assert_eq!(client_binding_epoch_from_headers(&headers), Ok(None));
-
-        headers.insert(
-            CLIENT_BINDING_EPOCH_HEADER,
-            axum::http::HeaderValue::from_str(&epoch).expect("canonical header value"),
-        );
-        assert_eq!(
-            client_binding_epoch_from_headers(&headers),
-            Ok(Some(
-                ClientBindingEpoch::parse(&epoch).expect("canonical epoch")
-            ))
-        );
-
-        for invalid in ["AA".repeat(32), "11".repeat(31), format!("{epoch},x")] {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                CLIENT_BINDING_EPOCH_HEADER,
-                axum::http::HeaderValue::from_str(&invalid).expect("HTTP-safe test value"),
-            );
-            assert_eq!(client_binding_epoch_from_headers(&headers), Err(()));
-        }
-
-        let mut duplicated = HeaderMap::new();
-        let value = axum::http::HeaderValue::from_str(&epoch).expect("canonical header value");
-        duplicated.append(CLIENT_BINDING_EPOCH_HEADER, value.clone());
-        duplicated.append(CLIENT_BINDING_EPOCH_HEADER, value);
-        assert_eq!(client_binding_epoch_from_headers(&duplicated), Err(()));
     }
 }

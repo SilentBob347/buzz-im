@@ -1856,7 +1856,6 @@ mod tests {
             tenant: buzz_core::TenantContext::resolved(community_b, "b.example"),
             remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
             corporate_identity_assertion: None,
-            client_binding_epoch: None,
             auth_state: RwLock::new(crate::connection::AuthState::Authenticated(
                 buzz_auth::ConnectionAuthContext {
                     pubkey: agent.public_key(),

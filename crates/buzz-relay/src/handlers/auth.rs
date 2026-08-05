@@ -16,7 +16,7 @@ use buzz_auth::{
     AuthTransport, VerifiedDelegationOutput, VerifiedEvidenceAdapter, VerifiedNostrProof,
 };
 use buzz_core::client_binding_bootstrap::{
-    ClientBindingBootstrapInputV1, CLIENT_BINDING_BOOTSTRAP_SUB_ID,
+    ClientBindingBootstrapInputV1, ClientBindingScopeV1, CLIENT_BINDING_BOOTSTRAP_SUB_ID,
 };
 use tracing::{debug, info, warn};
 
@@ -444,21 +444,25 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     return;
                 }
             };
+            let client_binding_scope =
+                ClientBindingScopeV1::from_verified_auth_event(&verified_event)
+                    .ok()
+                    .filter(|scope| scope.relay_signer() == state.relay_keypair.public_key());
             *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
             state.conn_manager.set_authenticated_authority(
                 conn_id,
                 Arc::clone(&verified_proof),
                 verified_assertion.clone(),
             );
-            if let (Some(runtime), Some(assertion), Some(epoch)) = (
+            if let (Some(runtime), Some(assertion), Some(scope)) = (
                 state.client_status_runtime().cloned(),
                 verified_assertion,
-                conn.client_binding_epoch.clone(),
+                client_binding_scope,
             ) {
                 let bootstrap_queued = ClientBindingBootstrapInputV1::new(
                     conn.tenant.community(),
                     pubkey,
-                    epoch,
+                    scope.connection_epoch().clone(),
                     nostr::Timestamp::now().as_secs(),
                 )
                 .ok()
