@@ -101,7 +101,11 @@ DECLARE
     invalidation_event UUID;
     invalidation_generation BIGINT;
 BEGIN
-    domain_id := COALESCE(NEW.community_id, OLD.community_id);
+    IF TG_OP = 'DELETE' THEN
+        domain_id := OLD.community_id;
+    ELSE
+        domain_id := NEW.community_id;
+    END IF;
 
     -- The nested generation update below has its own table trigger. The outer
     -- protected mutation owns the epoch advancement, so the nested trigger is
@@ -186,6 +190,23 @@ BEGIN
     RETURN NULL;
 END
 $$;
+
+-- Kind 30617 is live Git authorization policy. Install these triggers only
+-- after the epoch function exists so fresh databases migrate in one pass.
+CREATE TRIGGER git_policy_insert_authority_epoch
+    AFTER INSERT ON events
+    FOR EACH ROW WHEN (NEW.kind = 30617)
+    EXECUTE FUNCTION advance_authorization_authority_epoch();
+
+CREATE TRIGGER git_policy_update_authority_epoch
+    AFTER UPDATE ON events
+    FOR EACH ROW WHEN (OLD.kind = 30617 OR NEW.kind = 30617)
+    EXECUTE FUNCTION advance_authorization_authority_epoch();
+
+CREATE TRIGGER git_policy_delete_authority_epoch
+    AFTER DELETE ON events
+    FOR EACH ROW WHEN (OLD.kind = 30617)
+    EXECUTE FUNCTION advance_authorization_authority_epoch();
 
 CREATE TRIGGER identity_bindings_authority_epoch
     AFTER INSERT OR UPDATE OR DELETE ON identity_bindings
