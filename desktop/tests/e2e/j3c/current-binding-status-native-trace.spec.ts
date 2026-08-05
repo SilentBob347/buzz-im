@@ -113,7 +113,7 @@ async function expectNoLegacyTrustPresentation(page: Page) {
   await expect(page.getByText("Verified as", { exact: false })).toHaveCount(0);
 }
 
-test("Rust native-flow projections drive exact-author lifecycle presentation", async ({
+test("Rust native-flow trace drives exact-author lifecycle presentation", async ({
   page,
 }) => {
   const currentProjections = trace.steps.flatMap((step) =>
