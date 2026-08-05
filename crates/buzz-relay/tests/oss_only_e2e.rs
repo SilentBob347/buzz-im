@@ -297,6 +297,20 @@ impl VerifiedProviderEvidenceResolver for AmbiguousProviderEvidenceResolver {
     }
 }
 
+struct AbsentProviderEvidenceResolver;
+
+impl VerifiedProviderEvidenceResolver for AbsentProviderEvidenceResolver {
+    fn resolve(
+        &self,
+        _request: &ProtectedOperationRequest,
+    ) -> std::result::Result<
+        VerifiedProviderEvidenceResolution,
+        VerifiedProviderEvidenceResolutionError,
+    > {
+        Ok(VerifiedProviderEvidenceResolution::Absent)
+    }
+}
+
 struct FixedAuthorizationClock;
 
 impl AuthorizationClock for FixedAuthorizationClock {
@@ -312,6 +326,9 @@ async fn live_two_relay_clients_and_migrations() {
     verify_exact_migration_chain(&config)
         .await
         .expect("M01 exact SQLx migration chain");
+    absent_provider_evidence_denies_runtime(&config)
+        .await
+        .expect("D01 absent typed provider evidence denies before authority resolution");
     ambiguous_provider_evidence_denies_runtime(&config)
         .await
         .expect("D02 ambiguous typed provider evidence denies in the relay runtime");
@@ -332,14 +349,16 @@ async fn live_two_relay_clients_and_migrations() {
         .expect("P01 runtime logs, errors, and metrics redact planted canaries");
 }
 
-async fn ambiguous_provider_evidence_denies_runtime(config: &LiveConfig) -> Result<()> {
+fn verified_direct_request(
+    config: &LiveConfig,
+    challenge: &'static str,
+) -> Result<ProtectedOperationRequest> {
     let authorization_domain = CommunityId::from_uuid(Uuid::new_v4());
     let keys = Keys::generate();
-    let challenge = "oss-e2e-d02-ambiguous-provider-evidence";
     let relay_url = RelayUrl::parse(&config.relay_identity).context("parse relay identity")?;
     let auth_event = EventBuilder::auth(challenge, relay_url)
         .sign_with_keys(&keys)
-        .context("sign D02 synthetic NIP-42 proof")?;
+        .context("sign synthetic direct-origin NIP-42 proof")?;
     let proof = VerifiedEvidenceAdapter::new()
         .verify_nip42(
             authorization_domain,
@@ -349,15 +368,45 @@ async fn ambiguous_provider_evidence_denies_runtime(config: &LiveConfig) -> Resu
             &config.relay_identity,
             None,
         )
-        .context("verify D02 synthetic NIP-42 proof")?;
-    let request = ProtectedOperationRequest::new(
+        .context("verify synthetic direct-origin NIP-42 proof")?;
+    ProtectedOperationRequest::new(
         Arc::new(proof),
         None,
         AuthorizationCapability::CommunityRead,
         Uuid::new_v4(),
         "ws_req",
     )
-    .context("construct D02 typed protected request")?;
+    .context("construct typed direct-origin protected request")
+}
+
+async fn absent_provider_evidence_denies_runtime(config: &LiveConfig) -> Result<()> {
+    let request = verified_direct_request(config, "oss-e2e-d01-absent-provider-evidence")?;
+    let authorization_domain = request.authorization_domain();
+    let runtime = ProtectedTransportRuntime::new(
+        [DomainTransportPolicy::from_server_configuration(
+            authorization_domain,
+            AuthorizationMode::Enforce,
+        )],
+        Arc::new(UnreachableAuthorizationResolver),
+        Arc::new(FixedAuthorizationClock),
+    )
+    .context("construct D01 relay authorization runtime")?
+    .with_provider_evidence_resolver(Arc::new(AbsentProviderEvidenceResolver));
+
+    match runtime.authorize(&request).await {
+        Err(ProtectedTransportError::Resolution(error)) => ensure!(
+            error.code() == "provider_evidence_missing",
+            "D01 absent evidence returned the wrong denial class"
+        ),
+        Err(error) => bail!("D01 absent evidence returned the wrong denial: {error}"),
+        Ok(_) => bail!("D01 absent evidence reached an authority grant"),
+    }
+    Ok(())
+}
+
+async fn ambiguous_provider_evidence_denies_runtime(config: &LiveConfig) -> Result<()> {
+    let request = verified_direct_request(config, "oss-e2e-d02-ambiguous-provider-evidence")?;
+    let authorization_domain = request.authorization_domain();
     let runtime = ProtectedTransportRuntime::new(
         [DomainTransportPolicy::from_server_configuration(
             authorization_domain,

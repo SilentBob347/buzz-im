@@ -264,7 +264,7 @@ run_live_topology() {
     failed_scenario="TOPOLOGY_PRE_RESTART"
     return 1
   fi
-  completed_scenarios+=(M01 A01 D02 H01 G01 AU01 P01)
+  completed_scenarios+=(M01 A01 D01 D02 H01 G01 AU01 P01)
   restart_relay_b
   if ! cargo_test -p buzz-relay --test oss_only_e2e \
     restarted_relay_restores_persisted_event -- --ignored --exact --nocapture; then
