@@ -2,11 +2,10 @@ import { expect, test, type Page } from "@playwright/test";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
-const CURRENT_PROJECTION_EVENT = "current-binding-projection-changed";
 const MATCHING_MESSAGE = "Current binding belongs to this exact author.";
 const OTHER_MESSAGE = "Current binding must not decorate this author.";
 const LEGACY_ALIAS = "legacy-relay-alias-must-stay-hidden";
-const OPAQUE_EPOCH = "opaque-epoch-must-stay-hidden";
+const CONNECTION_EPOCH = "11111111-1111-4111-8111-111111111111";
 
 async function waitForMockLiveSubscription(page: Page) {
   await expect
@@ -24,33 +23,18 @@ async function waitForMockLiveSubscription(page: Page) {
 async function waitForProjectionBridgeBootstrap(page: Page) {
   await expect
     .poll(() =>
-      page.evaluate(() =>
-        window.__BUZZ_E2E_COMMANDS__?.includes(
-          "get_current_binding_projection",
-        ),
+      page.evaluate(
+        () => window.__BUZZ_E2E_EMIT_CURRENT_PROJECTION__?.(null) ?? false,
       ),
     )
     .toBe(true);
-
-  // Let the unsupported mock snapshot reject and fail closed before sending a
-  // newer live event through the production listener/store path.
-  await page.evaluate(
-    () =>
-      new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
-      }),
-  );
 }
 
 async function emitProjection(page: Page, payload: unknown) {
-  await page.evaluate(
-    async ({ event, value }) => {
-      const emit = window.__BUZZ_E2E_EMIT_TAURI_EVENT__;
-      if (!emit) throw new Error("Mock Tauri event bridge is not installed.");
-      await emit(event, value);
-    },
-    { event: CURRENT_PROJECTION_EVENT, value: payload },
-  );
+  const emitted = await page.evaluate((value) => {
+    return window.__BUZZ_E2E_EMIT_CURRENT_PROJECTION__?.(value) ?? false;
+  }, payload);
+  if (!emitted) throw new Error("Native projection channel is not connected.");
 }
 
 test("current relay binding is exact-author, generic, clearable, and passively expiring", async ({
@@ -104,11 +88,9 @@ test("current relay binding is exact-author, generic, clearable, and passively e
 
   const freshUntil = Math.floor(Date.now() / 1_000) + 30;
   await emitProjection(page, {
-    connectionEpoch: OPAQUE_EPOCH,
+    connectionEpoch: CONNECTION_EPOCH,
     eventAuthorPubkey: TEST_IDENTITIES.bob.pubkey,
     freshUntil,
-    name: LEGACY_ALIAS,
-    verifiedName: LEGACY_ALIAS,
   });
 
   const badge = matchingRow.getByTestId("current-relay-binding");
@@ -123,7 +105,7 @@ test("current relay binding is exact-author, generic, clearable, and passively e
   for (const hiddenValue of [
     TEST_IDENTITIES.bob.pubkey,
     String(freshUntil),
-    OPAQUE_EPOCH,
+    CONNECTION_EPOCH,
     LEGACY_ALIAS,
     "eventauthorpubkey",
     "freshuntil",
@@ -151,7 +133,7 @@ test("current relay binding is exact-author, generic, clearable, and passively e
 
   const expiringFreshUntil = Math.floor(Date.now() / 1_000) + 4;
   await emitProjection(page, {
-    connectionEpoch: "opaque-expiring-epoch",
+    connectionEpoch: "22222222-2222-4222-8222-222222222222",
     eventAuthorPubkey: TEST_IDENTITIES.bob.pubkey,
     freshUntil: expiringFreshUntil,
   });

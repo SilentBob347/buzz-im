@@ -1,6 +1,7 @@
 import { RelayClient } from "@/shared/api/relayClientSession";
+import { applyCurrentProjectionFromNative } from "@/features/binding-status/currentProjectionStore";
 
-export const relayClient = new RelayClient();
+export const relayClient = new RelayClient(applyCurrentProjectionFromNative);
 
 /**
  * Notify the relay client which channel is currently visible in the UI.

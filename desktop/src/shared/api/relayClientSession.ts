@@ -69,6 +69,8 @@ import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
 import { AuthOkTracker } from "@/shared/api/relayAuthPolicy";
 import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
 
+export type RelayProjectionSink = (candidate: unknown) => void;
+
 export class RelayClient {
   private wsId: number | null = null;
   private relayUrl: string | null = null;
@@ -91,12 +93,17 @@ export class RelayClient {
   private hasConnectedOnce = false;
   private notifyReconnectListeners = false;
   private onMessageChannel: Channel<unknown> | null = null;
+  private onProjectionChannel: Channel<unknown> | null = null;
   private connectionGeneration = 0;
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
   private authOkTracker = new AuthOkTracker();
 
   private terminal = false;
+
+  constructor(
+    private readonly projectionSink: RelayProjectionSink = () => {},
+  ) {}
 
   private connectionStateEmitter = new RelayConnectionStateEmitter("idle");
   private stallWatchdog = new RelayStallWatchdog({
@@ -172,6 +179,8 @@ export class RelayClient {
     this.reconnectListeners.clear();
     this.connectionStateEmitter.clear();
     this.onMessageChannel = null;
+    this.onProjectionChannel = null;
+    this.publishProjection(null);
     this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
   }
 
@@ -535,6 +544,7 @@ export class RelayClient {
     );
 
     const generation = ++this.connectionGeneration;
+    this.publishProjection(null);
     this.onMessageChannel = new Channel<unknown>((message) => {
       void this.handleWsMessage(message, generation).catch((error) => {
         if (generation !== this.connectionGeneration) return;
@@ -543,16 +553,24 @@ export class RelayClient {
         );
       });
     });
+    this.onProjectionChannel = new Channel<unknown>((candidate) => {
+      if (generation !== this.connectionGeneration) return;
+      this.publishProjection(candidate);
+    });
 
     try {
       if (!this.relayUrl) {
         this.relayUrl = await getRelayWsUrl();
       }
-      const wsId = await invoke<number>("plugin:websocket|connect", {
-        url: this.relayUrl,
-        onMessage: this.onMessageChannel,
-        config: {},
-      });
+      const wsId = await invoke<number>(
+        "plugin:websocket|connect_with_status",
+        {
+          url: this.relayUrl,
+          onMessage: this.onMessageChannel,
+          onProjection: this.onProjectionChannel,
+          config: {},
+        },
+      );
       if (generation !== this.connectionGeneration) {
         void closeWebSocket(wsId, "stale connection attempt");
         throw new Error("Relay connection attempt was superseded.");
@@ -1014,6 +1032,8 @@ export class RelayClient {
     },
   ) {
     this.onMessageChannel = null;
+    this.onProjectionChannel = null;
+    this.publishProjection(null);
     this.stallWatchdog.stop();
     this.connectionGeneration++;
     if (this.stabilityTimer !== null) {
@@ -1082,6 +1102,22 @@ export class RelayClient {
 
     if (options?.reconnect !== false) {
       this.scheduleReconnect();
+    }
+  }
+
+  private publishProjection(candidate: unknown) {
+    try {
+      this.projectionSink(candidate);
+    } catch {
+      // Presentation failure must not disturb relay transport. Try to clear
+      // once, without exposing the rejected candidate to logs or errors.
+      if (candidate !== null) {
+        try {
+          this.projectionSink(null);
+        } catch {
+          // The projection is optional presentation; relay operation remains.
+        }
+      }
     }
   }
 }
