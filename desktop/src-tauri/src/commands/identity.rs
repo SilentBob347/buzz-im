@@ -339,7 +339,12 @@ pub async fn import_identity(
     password: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> Result<IdentityInfo, String> {
-    tokio::task::spawn_blocking(move || {
+    let projection_app = app_handle.clone();
+    projection_app
+        .state::<crate::native_websocket::WebSocketManager>()
+        .invalidate_projection()
+        .await;
+    let identity = tokio::task::spawn_blocking(move || {
         // NIP-49 backups require a passphrase and decrypt entirely in Rust.
         // Raw nsec/hex input follows the existing parser path unchanged.
         let password = password.map(zeroize::Zeroizing::new);
@@ -385,7 +390,8 @@ pub async fn import_identity(
         })
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+    .map_err(|e| format!("spawn_blocking failed: {e}"))??;
+    Ok(identity)
 }
 
 /// Commit an imported identity: durably persist, swap in-memory keys, clear
@@ -541,6 +547,10 @@ pub async fn sign_out(app: tauri::AppHandle) -> Result<(), String> {
                 .to_string(),
         );
     }
+
+    app.state::<crate::native_websocket::WebSocketManager>()
+        .invalidate_projection()
+        .await;
 
     // Stop all managed agents before restart so they don't race the wipe.
     if let Err(e) = crate::shutdown::shutdown_managed_agents(&app) {

@@ -132,6 +132,9 @@ pub async fn apply_workspace(
     app: AppHandle,
 ) -> Result<(), String> {
     let restore_app = app.clone();
+    app.state::<crate::native_websocket::WebSocketManager>()
+        .invalidate_projection()
+        .await;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
 

@@ -1,19 +1,36 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
+use nostr::PublicKey;
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, plugin::TauriPlugin, Manager, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message},
+    tungstenite::{
+        client::IntoClientRequest,
+        http::HeaderValue,
+        protocol::{frame::coding::CloseCode, CloseFrame, Message},
+    },
 };
 use tokio_util::sync::CancellationToken;
+use url::{Host, Url};
+
+use buzz_core_pkg::client_binding_bootstrap::{ClientBindingEpoch, CLIENT_BINDING_EPOCH_HEADER};
+
+use crate::{
+    app_state::AppState,
+    client_binding_status_session::{
+        is_reserved_text, ClientBindingStatusSession, CurrentProjection, ProjectionUpdate,
+    },
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const SEND_QUEUE_CAPACITY: usize = 64;
+const NIP11_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_NIP11_BODY_BYTES: usize = 64 * 1024;
 
 pub(crate) fn install_crypto_provider() {
     // Dependencies enable both rustls providers; choose one before TLS setup.
@@ -81,10 +98,24 @@ struct ConnectionHandle {
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
+struct ProjectionOwner {
+    id: Id,
+    epoch: ClientBindingEpoch,
+    channel: Channel<serde_json::Value>,
+}
+
+#[derive(Default)]
+struct ProjectionState {
+    generation: u64,
+    owner: Option<ProjectionOwner>,
+    current: Option<CurrentProjection>,
+}
+
 #[derive(Clone)]
 pub(crate) struct WebSocketManager {
     connections: Arc<Mutex<HashMap<Id, Arc<ConnectionHandle>>>>,
     connect_cancel: Arc<Mutex<CancellationToken>>,
+    projection: Arc<Mutex<ProjectionState>>,
 }
 
 impl Default for WebSocketManager {
@@ -92,6 +123,7 @@ impl Default for WebSocketManager {
         Self {
             connections: Arc::default(),
             connect_cancel: Arc::new(Mutex::new(CancellationToken::new())),
+            projection: Arc::default(),
         }
     }
 }
@@ -99,6 +131,114 @@ impl Default for WebSocketManager {
 impl WebSocketManager {
     async fn remove(&self, id: Id) -> Option<Arc<ConnectionHandle>> {
         self.connections.lock().await.remove(&id)
+    }
+
+    async fn remove_if_current(&self, id: Id, handle: &Arc<ConnectionHandle>) {
+        let mut connections = self.connections.lock().await;
+        if connections
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            connections.remove(&id);
+        }
+    }
+
+    async fn begin_projection_attempt(&self) -> u64 {
+        let mut projection = self.projection.lock().await;
+        projection.generation = projection.generation.wrapping_add(1);
+        if let Some(previous) = projection.owner.take() {
+            let _ = previous.channel.send(serde_json::Value::Null);
+        }
+        projection.current = None;
+        projection.generation
+    }
+
+    async fn activate_projection(
+        &self,
+        generation: u64,
+        id: Id,
+        epoch: ClientBindingEpoch,
+        channel: Channel<serde_json::Value>,
+    ) -> bool {
+        let mut projection = self.projection.lock().await;
+        if projection.generation != generation {
+            let _ = channel.send(serde_json::Value::Null);
+            return false;
+        }
+        projection.current = None;
+        let _ = channel.send(serde_json::Value::Null);
+        projection.owner = Some(ProjectionOwner { id, epoch, channel });
+        true
+    }
+
+    async fn apply_projection_update(
+        &self,
+        id: Id,
+        epoch: &ClientBindingEpoch,
+        update: ProjectionUpdate,
+    ) {
+        if matches!(update, ProjectionUpdate::Unchanged) {
+            return;
+        }
+        let mut projection = self.projection.lock().await;
+        let Some(owner) = projection.owner.as_ref() else {
+            return;
+        };
+        if owner.id != id || owner.epoch != *epoch {
+            return;
+        }
+        projection.current = match update {
+            ProjectionUpdate::Current(current) => Some(current),
+            ProjectionUpdate::Clear | ProjectionUpdate::Unchanged => None,
+        };
+        let value = projection
+            .current
+            .as_ref()
+            .and_then(|current| serde_json::to_value(current).ok())
+            .unwrap_or(serde_json::Value::Null);
+        if let Some(owner) = projection.owner.as_ref() {
+            let _ = owner.channel.send(value);
+        }
+    }
+
+    async fn clear_projection_if_owner(&self, id: Id, epoch: &ClientBindingEpoch) {
+        let mut projection = self.projection.lock().await;
+        if projection
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.id == id && owner.epoch == *epoch)
+        {
+            if let Some(owner) = projection.owner.take() {
+                let _ = owner.channel.send(serde_json::Value::Null);
+            }
+            projection.current = None;
+        }
+    }
+
+    /// Invalidate all browser-visible status and revoke the current socket's
+    /// ownership. Late work from that socket is rejected by the owner fence.
+    pub(crate) async fn invalidate_projection(&self) {
+        let mut projection = self.projection.lock().await;
+        projection.generation = projection.generation.wrapping_add(1);
+        if let Some(owner) = projection.owner.take() {
+            let _ = owner.channel.send(serde_json::Value::Null);
+        }
+        projection.current = None;
+    }
+
+    async fn current_projection(&self) -> Option<CurrentProjection> {
+        let mut projection = self.projection.lock().await;
+        if projection
+            .current
+            .as_ref()
+            .is_some_and(|current| unix_now() >= current.fresh_until)
+        {
+            projection.current = None;
+            if let Some(owner) = projection.owner.as_ref() {
+                let _ = owner.channel.send(serde_json::Value::Null);
+            }
+        }
+        projection.current.clone()
     }
 
     async fn disconnect_handle(handle: Arc<ConnectionHandle>) {
@@ -116,20 +256,53 @@ impl WebSocketManager {
 
     async fn disconnect(&self, id: Id) {
         if let Some(handle) = self.remove(id).await {
+            let owner_epoch = self
+                .projection
+                .lock()
+                .await
+                .owner
+                .as_ref()
+                .filter(|owner| owner.id == id)
+                .map(|owner| owner.epoch.clone());
+            if let Some(epoch) = owner_epoch {
+                self.clear_projection_if_owner(id, &epoch).await;
+            }
             Self::disconnect_handle(handle).await;
         }
     }
 }
 
+#[cfg(test)]
 async fn open_connection(
     manager: &WebSocketManager,
     url: &str,
     on_message: Channel<serde_json::Value>,
 ) -> Result<Id, String> {
+    open_connection_with_projection(manager, url, on_message, None, None, None).await
+}
+
+async fn open_connection_with_projection(
+    manager: &WebSocketManager,
+    url: &str,
+    on_message: Channel<serde_json::Value>,
+    mut status_session: Option<ClientBindingStatusSession>,
+    projection_channel: Option<Channel<serde_json::Value>>,
+    projection_generation: Option<u64>,
+) -> Result<Id, String> {
     let connect_cancel = manager.connect_cancel.lock().await.clone();
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| error.to_string())?;
+    if let Some(session) = status_session.as_ref() {
+        request.headers_mut().insert(
+            CLIENT_BINDING_EPOCH_HEADER,
+            HeaderValue::from_str(session.connection_epoch().as_str())
+                .map_err(|_| "invalid WebSocket request".to_string())?,
+        );
+    }
     let (socket, _) = tokio::select! {
         _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url)) => result
+        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)) => result
             .map_err(|_| "WebSocket connection timed out".to_string())?
             .map_err(|error| error.to_string())?,
     };
@@ -157,14 +330,32 @@ async fn open_connection(
     let mut task_slot = handle.task.lock().await;
     manager.connections.lock().await.insert(id, handle.clone());
 
+    let activated = match (
+        status_session.as_ref(),
+        projection_channel.clone(),
+        projection_generation,
+    ) {
+        (Some(session), Some(channel), Some(generation)) => {
+            manager
+                .activate_projection(generation, id, session.connection_epoch().clone(), channel)
+                .await
+        }
+        _ => false,
+    };
+    if !activated {
+        status_session = None;
+    }
+
     let task_manager = manager.clone();
-    let task = tauri::async_runtime::spawn(run_connection(
+    let task = tauri::async_runtime::spawn(run_connection_inner(
         id,
         socket,
         receiver,
         cancel,
         on_message,
         task_manager,
+        handle.clone(),
+        status_session,
     ));
     *task_slot = Some(task);
     drop(task_slot);
@@ -175,11 +366,121 @@ async fn open_connection(
 #[tauri::command]
 async fn connect(
     manager: tauri::State<'_, WebSocketManager>,
+    state: tauri::State<'_, AppState>,
     url: String,
     on_message: Channel<serde_json::Value>,
+    on_projection: Option<Channel<serde_json::Value>>,
     _config: Option<serde_json::Value>,
 ) -> Result<Id, String> {
-    open_connection(manager.inner(), &url, on_message).await
+    let projection_generation = match on_projection.as_ref() {
+        Some(_) => Some(manager.begin_projection_attempt().await),
+        None => None,
+    };
+    if let Some(channel) = on_projection.as_ref() {
+        let _ = channel.send(serde_json::Value::Null);
+    }
+    let status_session = match on_projection.as_ref() {
+        Some(_) => prepare_status_session(&state, &url).await,
+        None => None,
+    };
+    open_connection_with_projection(
+        manager.inner(),
+        &url,
+        on_message,
+        status_session,
+        on_projection,
+        projection_generation,
+    )
+    .await
+}
+
+async fn prepare_status_session(
+    state: &AppState,
+    requested_url: &str,
+) -> Option<ClientBindingStatusSession> {
+    if requested_url != crate::relay::relay_ws_url_with_override(state) {
+        return None;
+    }
+    let expected_author = state.signing_keys().ok()?.public_key();
+    let relay_signer = fetch_nip11_signer(requested_url).await.ok()?;
+    let mut epoch_bytes = [0_u8; 32];
+    getrandom::getrandom(&mut epoch_bytes).ok()?;
+    Some(ClientBindingStatusSession::new(
+        relay_signer,
+        expected_author,
+        ClientBindingEpoch::from_random_bytes(epoch_bytes),
+    ))
+}
+
+#[derive(Deserialize)]
+struct Nip11Identity {
+    #[serde(rename = "self")]
+    relay_self: String,
+}
+
+async fn fetch_nip11_signer(relay_url: &str) -> Result<PublicKey, String> {
+    let url = nip11_url(relay_url)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(NIP11_TIMEOUT)
+        .build()
+        .map_err(|_| "NIP-11 unavailable".to_string())?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/nostr+json")
+        .send()
+        .await
+        .map_err(|_| "NIP-11 unavailable".to_string())?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_NIP11_BODY_BYTES as u64)
+    {
+        return Err("NIP-11 unavailable".to_string());
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| "NIP-11 unavailable".to_string())?;
+        if body.len().saturating_add(chunk.len()) > MAX_NIP11_BODY_BYTES {
+            return Err("NIP-11 unavailable".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let identity: Nip11Identity =
+        serde_json::from_slice(&body).map_err(|_| "NIP-11 unavailable".to_string())?;
+    if identity.relay_self.len() != 64
+        || !identity
+            .relay_self
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("NIP-11 unavailable".to_string());
+    }
+    PublicKey::from_hex(&identity.relay_self).map_err(|_| "NIP-11 unavailable".to_string())
+}
+
+fn nip11_url(relay_url: &str) -> Result<Url, String> {
+    let mut url = Url::parse(relay_url).map_err(|_| "NIP-11 unavailable".to_string())?;
+    match url.scheme() {
+        "wss" => url
+            .set_scheme("https")
+            .map_err(|_| "NIP-11 unavailable".to_string())?,
+        "ws" if is_loopback_url(&url) => url
+            .set_scheme("http")
+            .map_err(|_| "NIP-11 unavailable".to_string())?,
+        _ => return Err("NIP-11 unavailable".to_string()),
+    }
+    Ok(url)
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => IpAddr::V4(address).is_loopback(),
+        Some(Host::Ipv6(address)) => IpAddr::V6(address).is_loopback(),
+        None => false,
+    }
 }
 
 pub(crate) async fn send_message(
@@ -241,6 +542,7 @@ async fn disconnect(manager: tauri::State<'_, WebSocketManager>, id: Id) -> Resu
 
 #[tauri::command]
 async fn disconnect_all(manager: tauri::State<'_, WebSocketManager>) -> Result<(), String> {
+    manager.invalidate_projection().await;
     let mut connect_cancel = manager.connect_cancel.lock().await;
     connect_cancel.cancel();
     *connect_cancel = CancellationToken::new();
@@ -256,18 +558,58 @@ async fn disconnect_all(manager: tauri::State<'_, WebSocketManager>) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
 async fn run_connection<S>(
     id: Id,
-    mut socket: tokio_tungstenite::WebSocketStream<S>,
-    mut receiver: mpsc::Receiver<SendRequest>,
+    socket: tokio_tungstenite::WebSocketStream<S>,
+    receiver: mpsc::Receiver<SendRequest>,
     cancel: CancellationToken,
     on_message: Channel<serde_json::Value>,
     manager: WebSocketManager,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let Some(handle) = manager.connections.lock().await.get(&id).cloned() else {
+        return;
+    };
+    run_connection_inner(
+        id, socket, receiver, cancel, on_message, manager, handle, None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_connection_inner<S>(
+    id: Id,
+    mut socket: tokio_tungstenite::WebSocketStream<S>,
+    mut receiver: mpsc::Receiver<SendRequest>,
+    cancel: CancellationToken,
+    on_message: Channel<serde_json::Value>,
+    manager: WebSocketManager,
+    handle: Arc<ConnectionHandle>,
+    mut status_session: Option<ClientBindingStatusSession>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
+        let expiry_delay = status_session
+            .as_ref()
+            .and_then(ClientBindingStatusSession::projected_fresh_until)
+            .map(|fresh_until| Duration::from_secs(fresh_until.saturating_sub(unix_now())));
+        let expiry = async {
+            match expiry_delay {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
+            _ = expiry => {
+                if let Some(session) = status_session.as_mut() {
+                    let epoch = session.connection_epoch().clone();
+                    let update = session.expire(unix_now());
+                    manager.apply_projection_update(id, &epoch, update).await;
+                }
+            }
             _ = cancel.cancelled() => {
                 let _ = tokio::time::timeout(
                     SHUTDOWN_TIMEOUT,
@@ -290,7 +632,24 @@ async fn run_connection<S>(
             }
             incoming = socket.next() => {
                 let message = match incoming {
-                    Some(Ok(message)) => outbound_message(message),
+                    Some(Ok(message)) => {
+                        let reserved_text = match &message {
+                            Message::Text(value) => Some(value.as_str()),
+                            Message::Binary(value) => std::str::from_utf8(value).ok(),
+                            _ => None,
+                        }
+                        .filter(|text| is_reserved_text(text));
+                        if let Some(text) = reserved_text {
+                            if let Some(session) = status_session.as_mut() {
+                                let epoch = session.connection_epoch().clone();
+                                if let Some(update) = session.consume_text(text, unix_now()) {
+                                    manager.apply_projection_update(id, &epoch, update).await;
+                                }
+                            }
+                            continue;
+                        }
+                        outbound_message(message)
+                    }
                     Some(Err(error)) => OutboundMessage::Error(error.to_string()),
                     None => OutboundMessage::Close(None),
                 };
@@ -302,7 +661,19 @@ async fn run_connection<S>(
             }
         }
     }
-    manager.remove(id).await;
+    if let Some(session) = status_session.as_mut() {
+        let epoch = session.connection_epoch().clone();
+        let update = session.disconnect();
+        manager.apply_projection_update(id, &epoch, update).await;
+        manager.clear_projection_if_owner(id, &epoch).await;
+    }
+    manager.remove_if_current(id, &handle).await;
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn outbound_message(message: Message) -> OutboundMessage {
@@ -326,13 +697,21 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             connect,
             send,
             disconnect,
-            disconnect_all
+            disconnect_all,
+            current_projection
         ])
         .setup(|app, _api| {
             app.manage(WebSocketManager::default());
             Ok(())
         })
         .build()
+}
+
+#[tauri::command]
+async fn current_projection(
+    manager: tauri::State<'_, WebSocketManager>,
+) -> Option<CurrentProjection> {
+    manager.current_projection().await
 }
 
 #[cfg(test)]
