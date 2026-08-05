@@ -83,6 +83,34 @@ CREATE TABLE git_repo_names (
 CREATE INDEX idx_git_repo_names_owner
     ON git_repo_names (community_id, owner_pubkey);
 
+-- ── Protected object authority ───────────────────────────────────────────────
+-- Desired-state equivalent of additive migration 0033. Even in legacy mode,
+-- every Git/media visibility write acquires this durable migration fence before
+-- touching an object-store pointer or sidecar.
+
+CREATE TABLE protected_object_authority (
+    community_id     UUID NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    surface          TEXT NOT NULL CHECK (surface IN ('git', 'media')),
+    state            TEXT NOT NULL CHECK (state IN ('legacy', 'importing', 'postgresql')),
+    generation       BIGINT NOT NULL CHECK (generation > 0),
+    imported_objects BIGINT NOT NULL DEFAULT 0 CHECK (imported_objects >= 0),
+    inventory_sha256 TEXT,
+    started_at       TIMESTAMPTZ,
+    completed_at     TIMESTAMPTZ,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (community_id, surface),
+    CHECK (inventory_sha256 IS NULL OR inventory_sha256 ~ '^[0-9a-f]{64}$'),
+    CHECK (
+        (state = 'legacy' AND started_at IS NULL AND completed_at IS NULL)
+        OR (state = 'importing' AND started_at IS NOT NULL AND completed_at IS NULL)
+        OR (state = 'postgresql' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+            AND inventory_sha256 IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_protected_object_authority_state
+    ON protected_object_authority (state, community_id, surface);
+
 -- ── Channels ──────────────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". `community_id` immutable.
 -- Channel UUIDs stay valid wire identifiers, but they are NOT globally unique:
