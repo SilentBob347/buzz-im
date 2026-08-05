@@ -25,6 +25,11 @@ export type CurrentProjectionStore = {
 };
 
 const LOWERCASE_HEX_PUBKEY = /^[0-9a-f]{64}$/;
+const CURRENT_PROJECTION_KEYS = [
+  "connectionEpoch",
+  "eventAuthorPubkey",
+  "freshUntil",
+] as const;
 const DEFAULT_MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function logListenerError(): void {
@@ -36,8 +41,8 @@ function logListenerError(): void {
 /**
  * Copy the narrow native DTO into a frozen browser-owned value.
  *
- * Unknown properties are intentionally discarded. Expired projections are
- * represented by null; the deadline is exclusive.
+ * Unknown properties fail closed. Expired projections are represented by
+ * null; the deadline is exclusive.
  */
 export function parseCurrentProjection(
   candidate: unknown,
@@ -53,6 +58,13 @@ export function parseCurrentProjection(
   }
 
   const value = candidate as Record<string, unknown>;
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== CURRENT_PROJECTION_KEYS.length ||
+    !CURRENT_PROJECTION_KEYS.every((key, index) => keys[index] === key)
+  ) {
+    return null;
+  }
   const { eventAuthorPubkey, freshUntil, connectionEpoch } = value;
   if (
     typeof eventAuthorPubkey !== "string" ||

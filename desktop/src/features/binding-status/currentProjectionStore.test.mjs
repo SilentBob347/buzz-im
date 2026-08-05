@@ -57,11 +57,8 @@ function makeTimerHost(initialNow = 100) {
   };
 }
 
-test("parses only the frozen narrow DTO and strips native extras", () => {
-  const parsed = parseCurrentProjection(
-    projection({ rawEvent: "must-not-cross", revision: 42 }),
-    100,
-  );
+test("parses only the exact frozen narrow DTO", () => {
+  const parsed = parseCurrentProjection(projection(), 100);
 
   assert.deepEqual(parsed, projection());
   assert.deepEqual(Object.keys(parsed), [
@@ -73,6 +70,14 @@ test("parses only the frozen narrow DTO and strips native extras", () => {
   assert.throws(() => {
     parsed.connectionEpoch = "mutated";
   }, TypeError);
+
+  assert.equal(
+    parseCurrentProjection(
+      projection({ rawEvent: "must-not-cross", revision: 42 }),
+      100,
+    ),
+    null,
+  );
 });
 
 test("rejects noncanonical authors, invalid deadlines, and empty epochs", () => {
