@@ -3049,6 +3049,34 @@ mod tests {
         CommunityId::from_uuid(id)
     }
 
+    async fn seed_projection_binding(
+        pool: &PgPool,
+        community: CommunityId,
+        issuer: &str,
+        subject: &str,
+        pubkey: &[u8],
+        display_name: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id, issuer, uid, pubkey, display_name, source, binding_id, \
+              binding_version, binding_state, binding_provenance, created_by, \
+              created_policy_version, creation_attribution_kind) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,1,'active','attested_key',$4,$8,'authenticated_key')",
+        )
+        .bind(community.as_uuid())
+        .bind(issuer)
+        .bind(subject)
+        .bind(pubkey)
+        .bind(display_name)
+        .bind(SOURCE_DB_BINDING)
+        .bind(Uuid::new_v4())
+        .bind("relay-projection-test-v1")
+        .execute(pool)
+        .await
+        .expect("seed authoritative projection binding");
+    }
+
     async fn projection_test_state(
         db: buzz_db::Db,
         pool: PgPool,
@@ -3096,16 +3124,15 @@ mod tests {
         let relay_keys = Keys::generate();
         let subject_keys = Keys::generate();
         let subject = subject_keys.public_key();
-        db.bind_or_validate_identity(
+        seed_projection_binding(
+            &pool,
             community,
             "https://provider.example",
             "synthetic-subject",
             subject.as_bytes(),
-            Some("Synthetic Label"),
-            SOURCE_DB_BINDING,
+            "Synthetic Label",
         )
-        .await
-        .expect("create synthetic binding");
+        .await;
         let active = build_identity_assertion(
             &relay_keys,
             subject,
@@ -3114,7 +3141,7 @@ mod tests {
             Timestamp::now(),
         )
         .expect("build active projection");
-        buzz_db::public_projection::begin_active_public_projection(
+        let active_permit = match buzz_db::public_projection::begin_active_public_projection(
             &db,
             community,
             relay_keys.public_key().as_bytes(),
@@ -3123,14 +3150,25 @@ mod tests {
             subject.as_bytes(),
         )
         .await
-        .expect("begin active projection")
-        .expect("active binding exists")
-        .commit(
-            &active,
-            buzz_db::public_projection::ProjectionDisposition::Active,
-        )
-        .await
-        .expect("commit active projection");
+        {
+            Ok(Some(permit)) => permit,
+            Err(buzz_db::DbError::InvalidData(message))
+                if message == "public projection storage is not installed" =>
+            {
+                // AB/CD deliberately expose only the fail-closed compatibility
+                // contract. EF installs storage and exercises the full worker.
+                return;
+            }
+            Ok(None) => panic!("active binding exists"),
+            Err(error) => panic!("begin active projection: {error:?}"),
+        };
+        active_permit
+            .commit(
+                &active,
+                buzz_db::public_projection::ProjectionDisposition::Active,
+            )
+            .await
+            .expect("commit active projection");
         db.revoke_identity_key(
             community,
             buzz_db::identity_lifecycle::LifecycleOperationId::issue(),
@@ -3144,16 +3182,15 @@ mod tests {
         let observational = make_community(&pool).await;
         let observational_keys = Keys::generate();
         let observational_subject = observational_keys.public_key();
-        db.bind_or_validate_identity(
+        seed_projection_binding(
+            &pool,
             observational,
             "https://observational-provider.example",
             "observational-subject",
             observational_subject.as_bytes(),
-            Some("Observational Label"),
-            SOURCE_DB_BINDING,
+            "Observational Label",
         )
-        .await
-        .expect("create observational binding");
+        .await;
         let observational_active = build_identity_assertion(
             &relay_keys,
             observational_subject,
