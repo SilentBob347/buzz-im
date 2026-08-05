@@ -390,14 +390,44 @@ async fn websocket_http_fanout(config: &LiveConfig) -> Result<LiveScenario> {
     relay_b
         .subscribe_channel(subscription_id, channel_id, 1)
         .await?;
-    wait_for_redis_subscription(&config.redis_url, channel_id).await?;
+    let redis_channel = wait_for_redis_subscription(&config.redis_url, channel_id).await?;
+    let redis_client = redis::Client::open(config.redis_url.as_str())
+        .context("open live OSS Redis diagnostic client")?;
+    let mut redis_probe = redis_client
+        .get_async_pubsub()
+        .await
+        .context("connect live OSS Redis diagnostic subscriber")?;
+    redis_probe
+        .subscribe(&redis_channel)
+        .await
+        .context("subscribe live OSS Redis diagnostic subscriber")?;
     let event = EventBuilder::new(Kind::TextNote, "synthetic cross-relay fan-out")
         .tags([Tag::parse(["h", &channel_id.to_string()]).context("message h tag")?])
         .sign_with_keys(&owner)
         .context("sign synthetic fan-out event")?;
     let event_id = event.id.to_hex();
     relay_a.send_event(&event).await?;
-    relay_b.wait_for_event(subscription_id, &event_id).await?;
+    let mut redis_messages = redis_probe.on_message();
+    let redis_message = tokio::time::timeout(Duration::from_secs(5), redis_messages.next())
+        .await
+        .context("Redis did not publish the synthetic cross-relay event")?
+        .context("Redis diagnostic subscription ended before publication")?;
+    let redis_payload: String = redis_message
+        .get_payload()
+        .context("decode synthetic Redis publication")?;
+    let redis_event =
+        Event::from_json(&redis_payload).context("parse synthetic event from Redis publication")?;
+    ensure!(
+        redis_event.id.to_hex() == event_id,
+        "Redis diagnostic subscriber observed the wrong event"
+    );
+    if let Err(error) = relay_b.wait_for_event(subscription_id, &event_id).await {
+        let metrics = diagnostic_metric_lines(&config.relay_b_metrics).await;
+        bail!(
+            "relay B missed event {event_id} after Redis published it on {redis_channel}: \
+             {error:#}; relay-B metrics: {metrics}"
+        );
+    }
 
     let restart_state = RestartState {
         channel_id,
@@ -411,7 +441,7 @@ async fn websocket_http_fanout(config: &LiveConfig) -> Result<LiveScenario> {
     Ok(LiveScenario { owner, channel_id })
 }
 
-async fn wait_for_redis_subscription(redis_url: &str, channel_id: Uuid) -> Result<()> {
+async fn wait_for_redis_subscription(redis_url: &str, channel_id: Uuid) -> Result<String> {
     let client = redis::Client::open(redis_url).context("open live OSS Redis client")?;
     let mut connection = client
         .get_multiplexed_async_connection()
@@ -428,16 +458,54 @@ async fn wait_for_redis_subscription(redis_url: &str, channel_id: Uuid) -> Resul
             .query_async(&mut connection)
             .await
             .context("query live Redis subscriptions")?;
-        if channels
-            .iter()
-            .any(|channel| channel.ends_with(&expected_suffix))
+        if let Some(channel) = channels
+            .into_iter()
+            .find(|channel| channel.ends_with(&expected_suffix))
         {
-            return Ok(());
+            let subscribers: Vec<(String, u64)> = redis::cmd("PUBSUB")
+                .arg("NUMSUB")
+                .arg(&channel)
+                .query_async(&mut connection)
+                .await
+                .context("query live Redis subscriber count")?;
+            ensure!(
+                subscribers
+                    .iter()
+                    .any(|(observed, count)| observed == &channel && *count >= 1),
+                "Redis reported the scoped channel without a live subscriber"
+            );
+            return Ok(channel);
         }
         if tokio::time::Instant::now() >= deadline {
             bail!("relay B did not acknowledge scoped Redis subscription {pattern}");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn diagnostic_metric_lines(metrics_url: &str) -> String {
+    const NAMES: [&str; 3] = [
+        "buzz_multinode_fanout_total",
+        "buzz_multinode_fanout_lag_total",
+        "buzz_subscriptions_active",
+    ];
+    match Client::new().get(metrics_url).send().await {
+        Ok(response) => match response.text().await {
+            Ok(body) => {
+                let selected: Vec<_> = body
+                    .lines()
+                    .filter(|line| !line.starts_with('#'))
+                    .filter(|line| NAMES.iter().any(|name| line.starts_with(name)))
+                    .collect();
+                if selected.is_empty() {
+                    "requested metrics absent".to_owned()
+                } else {
+                    selected.join(" | ")
+                }
+            }
+            Err(error) => format!("metrics body unavailable: {error}"),
+        },
+        Err(error) => format!("metrics endpoint unavailable: {error}"),
     }
 }
 
