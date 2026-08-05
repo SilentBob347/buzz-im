@@ -13,6 +13,8 @@ const PRODUCTION_RUNTIME: &str = include_str!("../src/authorization_runtime/prod
 const AUTH_HANDLER: &str = include_str!("../src/handlers/auth.rs");
 const KIND_REGISTRY: &str = include_str!("../../buzz-core/src/kind.rs");
 const INGEST_HANDLER: &str = include_str!("../src/handlers/ingest.rs");
+const READ_ONLY_RELAY_CLIENT: &str =
+    include_str!("../../../desktop/src/shared/api/readOnlyRelayClient.ts");
 
 #[test]
 fn mandatory_o4_security_contracts_are_present() {
@@ -318,9 +320,9 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
                 continue;
             }
             let source = fs::read_to_string(&file).expect("source file is readable");
-            let native_consumer = file
-                == repo.join("desktop/src-tauri/src/client_binding_status_session.rs")
-                || file == repo.join("desktop/src-tauri/src/native_websocket.rs");
+            let native_session =
+                file == repo.join("desktop/src-tauri/src/client_binding_status_session.rs");
+            let native_socket = file == repo.join("desktop/src-tauri/src/native_websocket.rs");
             let native_module_declaration = file == repo.join("desktop/src-tauri/src/lib.rs");
             if native_module_declaration {
                 assert_eq!(
@@ -341,9 +343,21 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
                 "24244",
                 "deliver_verification_only",
             ] {
-                if native_consumer
-                    && matches!(forbidden, "ClientBindingStatus" | "client_binding_status")
-                {
+                let expected_native_count = match (native_session, native_socket, forbidden) {
+                    (true, false, "KIND_CLIENT_BINDING_STATUS") => Some(1),
+                    (true, false, "ClientBindingStatus") => Some(33),
+                    (true, false, "client_binding_status") => Some(2),
+                    (false, true, "ClientBindingStatus") => Some(5),
+                    (false, true, "client_binding_status") => Some(1),
+                    _ => None,
+                };
+                if let Some(expected) = expected_native_count {
+                    assert_eq!(
+                        source_to_scan.matches(forbidden).count(),
+                        expected,
+                        "{} changed the narrow native status allowance for {forbidden}",
+                        file.display()
+                    );
                     continue;
                 }
                 assert!(
@@ -392,8 +406,13 @@ fn auth_bootstrap_precedes_status_and_success_ack() {
         bootstrap < presentation && presentation < success,
         "bootstrap must be queued before O4 status and the NIP-42 OK"
     );
-    assert!(AUTH_HANDLER.contains("if let (Some(runtime), Some(assertion), Some(epoch)) ="));
+    assert!(AUTH_HANDLER.contains("ClientBindingScopeV1::from_verified_auth_event"));
+    assert!(AUTH_HANDLER.contains("scope.relay_signer() == state.relay_keypair.public_key()"));
+    assert!(AUTH_HANDLER.contains("if let (Some(runtime), Some(assertion), Some(scope)) ="));
     assert!(AUTH_HANDLER.contains("let presentation = if bootstrap_queued"));
+    assert!(!include_str!("../src/router.rs").contains("CLIENT_BINDING_EPOCH_HEADER"));
+    assert!(!READ_ONLY_RELAY_CLIENT.contains("onProjection"));
+    assert!(!READ_ONLY_RELAY_CLIENT.contains("nativeWebsocketId"));
 }
 
 #[test]
