@@ -301,7 +301,7 @@ async fn restarted_relay_restores_persisted_event() {
         .send_json(&json!([
             "REQ",
             subscription_id,
-            {"kinds": [1], "#h": [state.channel_id.to_string()]}
+            {"kinds": [buzz_core::kind::KIND_STREAM_MESSAGE], "#h": [state.channel_id.to_string()]}
         ]))
         .await
         .expect("query restarted relay");
