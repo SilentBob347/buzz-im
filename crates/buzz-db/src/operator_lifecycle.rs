@@ -488,7 +488,7 @@ fn validate_command(
             command.target_reference.is_none()
                 || command.target_pseudonym.is_none()
                 || command.replacement_reference.is_none()
-                || command.replacement.is_some()
+                || command.replacement.is_none()
                 || command.list_limit != 1
                 || command.list_after.is_some()
         }
@@ -773,11 +773,15 @@ async fn preview_tx(
     revision: u64,
 ) -> Result<OperationAttempt> {
     let target = command.target_reference.expect("validated preview target");
-    if resolve_active_binding_tx(tx, command.domain, target)
-        .await?
-        .is_none()
-    {
+    let replacement = command
+        .replacement
+        .as_ref()
+        .expect("validated preview replacement proof");
+    let Some(binding) = resolve_active_binding_tx(tx, command.domain, target).await? else {
         return Ok(OperationAttempt::Denied(DecisionReason::TargetMismatch));
+    };
+    if replacement_ineligible_tx(tx, command.domain, &binding, &replacement.pubkey).await? {
+        return Ok(OperationAttempt::Denied(DecisionReason::StaleExpectedState));
     }
     let result = OperatorLifecycleResult {
         operation_id: command.operation_id,
@@ -914,10 +918,7 @@ async fn rotate_tx(
     let Some(binding) = resolve_active_binding_tx(tx, command.domain, target).await? else {
         return Ok(OperationAttempt::Denied(DecisionReason::TargetMismatch));
     };
-    if binding.pubkey.as_slice() == replacement.pubkey
-        || has_pending_lineage_tx(tx, command.domain, &binding).await?
-        || replacement_denied_tx(tx, command.domain, &binding, &replacement.pubkey).await?
-    {
+    if replacement_ineligible_tx(tx, command.domain, &binding, &replacement.pubkey).await? {
         return Ok(OperationAttempt::Denied(DecisionReason::StaleExpectedState));
     }
     let next_version = binding
@@ -1595,7 +1596,11 @@ async fn replacement_denied_tx(
            EXISTS(SELECT 1 FROM identity_revoked_keys WHERE community_id=$1 AND pubkey=$4) OR \
            EXISTS(SELECT 1 FROM identity_migration_denied_keys WHERE community_id=$1 AND pubkey=$4) OR \
            EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$4 \
-                  AND binding_state='active' AND revoked_at IS NULL)",
+                  AND binding_state='active' AND revoked_at IS NULL) OR \
+           EXISTS(SELECT 1 FROM identity_retired_pairs WHERE community_id=$1 \
+                  AND issuer=$2 AND subject=$3 AND pubkey=$4) OR \
+           EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 \
+                  AND issuer=$2 AND uid=$3 AND pubkey=$4 AND revoked_at IS NOT NULL)",
     )
     .bind(domain.as_uuid())
     .bind(&binding.issuer)
@@ -1603,6 +1608,17 @@ async fn replacement_denied_tx(
     .bind(replacement.as_slice())
     .fetch_one(&mut **tx)
     .await?)
+}
+
+async fn replacement_ineligible_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    domain: CommunityId,
+    binding: &BindingRow,
+    replacement: &[u8; 32],
+) -> Result<bool> {
+    Ok(binding.pubkey.as_slice() == replacement
+        || has_pending_lineage_tx(tx, domain, binding).await?
+        || replacement_denied_tx(tx, domain, binding, replacement).await?)
 }
 
 async fn retire_pair_tx(

@@ -160,7 +160,9 @@ impl OperatorAuthenticator for Authenticator {
         assert_eq!(credential.expose_to_authenticator(), CREDENTIAL.as_bytes());
         let replacement = request
             .replacement_reference()
-            .map(|reference| GrantedOperatorReplacement::new(reference, [77; 32], [78; 32]))
+            .map(|reference| {
+                GrantedOperatorReplacement::new(reference, [reference.digest()[0]; 32], [78; 32])
+            })
             .transpose()?;
         let now = SystemClock.now_unix_seconds()?;
         Ok(Box::new(Grant {
@@ -289,9 +291,49 @@ async fn explicitly_composed_routes_reach_real_postgres_list_preview_revoke_and_
     let mut rotate = common_body(domain, Uuid::new_v4(), 2);
     rotate["target"] = json!(second);
     rotate["replacement"] = json!(reference(71));
-    let (status, rotated) = post(runtime, "/operator/v1/lifecycle/rotate", rotate).await;
+    let (status, rotated) = post(runtime.clone(), "/operator/v1/lifecycle/rotate", rotate).await;
     assert_eq!(status, StatusCode::OK, "rotate response: {rotated}");
     assert_eq!(rotated["lifecycle_revision"], 3);
+    scenarios += 1;
+
+    let mut current = common_body(domain, Uuid::new_v4(), 3);
+    current["limit"] = json!(10);
+    let (status, current) = post(runtime.clone(), "/operator/v1/lifecycle/list", current).await;
+    assert_eq!(status, StatusCode::OK, "current list response: {current}");
+    let current_target = current["records"]
+        .as_array()
+        .expect("current redacted list records")
+        .iter()
+        .find(|record| record["state"] == "active")
+        .and_then(|record| record["reference"].as_str())
+        .expect("current active replacement reference");
+    scenarios += 1;
+
+    let mut retired_preview = common_body(domain, Uuid::new_v4(), 3);
+    retired_preview["target"] = json!(current_target);
+    retired_preview["replacement"] = json!(reference(32));
+    let (status, denied_preview) = post(
+        runtime.clone(),
+        "/operator/v1/lifecycle/preview",
+        retired_preview,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "retired-key preview must fail closed: {denied_preview}"
+    );
+    scenarios += 1;
+
+    let mut rotate_back = common_body(domain, Uuid::new_v4(), 3);
+    rotate_back["target"] = json!(current_target);
+    rotate_back["replacement"] = json!(reference(32));
+    let (status, denied_rotate) = post(runtime, "/operator/v1/lifecycle/rotate", rotate_back).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "retired-key rotation must fail closed: {denied_rotate}"
+    );
     scenarios += 1;
 
     let receipts: i64 = sqlx::query_scalar(
@@ -308,9 +350,17 @@ async fn explicitly_composed_routes_reach_real_postgres_list_preview_revoke_and_
     .fetch_one(&fixture.pool)
     .await
     .expect("count reachable operator effects");
-    assert_eq!(receipts, 4);
+    let previews: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM authorization_lifecycle_previews WHERE community_id=$1",
+    )
+    .bind(domain)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count reachable operator previews");
+    assert_eq!(receipts, 7);
     assert_eq!(effects, 2);
-    assert_eq!(scenarios, 4, "every reachable route scenario executed");
+    assert_eq!(previews, 1, "denied preview cannot persist an impact plan");
+    assert_eq!(scenarios, 7, "every reachable route scenario executed");
 
     fixture.cleanup().await;
 }

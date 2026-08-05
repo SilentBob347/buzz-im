@@ -417,7 +417,8 @@ pub struct OperatorAuthorizationRequest {
 impl OperatorAuthorizationRequest {
     fn from_invocation(invocation: &OperatorInvocation) -> Self {
         let replacement_reference = match invocation.intent {
-            OperatorIntent::Rotate { replacement, .. } => Some(replacement),
+            OperatorIntent::Preview { replacement, .. }
+            | OperatorIntent::Rotate { replacement, .. } => Some(replacement),
             _ => None,
         };
         Self {
@@ -449,13 +450,13 @@ impl OperatorAuthorizationRequest {
         self.intent_fingerprint
     }
 
-    /// Requested replacement reference when a rotation needs fresh proof.
+    /// Requested replacement reference when a preview or rotation needs fresh proof.
     pub const fn replacement_reference(self) -> Option<OpaqueOperatorReference> {
         self.replacement_reference
     }
 }
 
-/// Fresh replacement material supplied only by an authenticated rotation grant.
+/// Fresh replacement material supplied by an authenticated preview or rotation grant.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GrantedOperatorReplacement {
     reference: OpaqueOperatorReference,
@@ -518,7 +519,7 @@ pub trait GrantedOperatorCapability: Send + Sync {
     fn provenance_reference(&self) -> OpaqueOperatorReference;
     /// Single-use approval evidence identities, parallel to request approvals.
     fn approval_evidence_ids(&self) -> &[Uuid];
-    /// Fresh replacement proof for an exact rotate intent, if any.
+    /// Fresh replacement proof for an exact preview or rotate intent, if any.
     fn replacement(&self) -> Option<GrantedOperatorReplacement>;
     /// Exclusive trusted expiry in Unix seconds.
     fn expires_at_unix_seconds(&self) -> u64;
@@ -586,7 +587,7 @@ impl AuthorizedOperatorOperation {
         self.expires_at_unix_seconds
     }
 
-    /// Fresh replacement material for a rotate operation.
+    /// Fresh replacement material for a preview or rotate operation.
     pub const fn replacement(&self) -> Option<GrantedOperatorReplacement> {
         self.replacement
     }
@@ -853,7 +854,8 @@ impl OperatorRuntime {
         }
         let replacement = grant.replacement();
         let expected_replacement = match invocation.intent {
-            OperatorIntent::Rotate { replacement, .. } => Some(replacement),
+            OperatorIntent::Preview { replacement, .. }
+            | OperatorIntent::Rotate { replacement, .. } => Some(replacement),
             _ => None,
         };
         if replacement.map(GrantedOperatorReplacement::reference) != expected_replacement {
