@@ -483,7 +483,7 @@ export const MessageRow = React.memo(
     );
     const showCurrentRelayBinding = hasCurrentRelayBindingForAuthor(
       currentProjection,
-      message.pubkey,
+      message.signerPubkey,
     );
     const agentOwnerNode = message.isAgent ? (
       <MessageAgentOwner
