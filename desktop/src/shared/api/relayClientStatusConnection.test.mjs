@@ -20,7 +20,7 @@ globalThis.window.__TAURI_INTERNALS__ = {
     switch (command) {
       case "get_relay_ws_url":
         return Promise.resolve(RELAY_URL);
-      case "plugin:websocket|connect_with_status":
+      case "plugin:websocket|connect_with_status": {
         messageChannel = args.onMessage;
         projectionChannel = args.onProjection;
         // Native channels can deliver before the invoke response reaches JS.
@@ -38,6 +38,7 @@ globalThis.window.__TAURI_INTERNALS__ = {
         if (authDelivery === "early") deliverAuth();
         else window.setTimeout(deliverAuth, 0);
         return Promise.resolve(socketId);
+      }
       case "create_auth_event":
         return Promise.resolve(
           JSON.stringify({
