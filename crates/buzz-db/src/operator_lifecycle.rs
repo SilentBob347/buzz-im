@@ -29,6 +29,10 @@ use crate::authorization_invalidation::{
     authorization_invalidation_request_fingerprint, AuthorizationInvalidationEntry,
     AuthorizationInvalidationRequest,
 };
+use crate::identity_binding::{
+    binding_lock_coordinate, key_lock_coordinate, lock_identity_coordinates_tx,
+    operation_lock_coordinate, principal_lock_coordinate,
+};
 use crate::{Db, DbError, Result};
 
 const MAX_RECORDS: usize = 100;
@@ -55,14 +59,17 @@ impl OperatorReferenceKey {
         self.epoch
     }
 
-    fn derive(&self, domain: CommunityId, binding_id: Uuid) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.bytes)
-            .expect("HMAC accepts a 32-byte key");
+    fn derive(
+        &self,
+        domain: CommunityId,
+        binding_id: Uuid,
+    ) -> std::result::Result<[u8; 32], hmac::digest::InvalidLength> {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.bytes)?;
         Mac::update(&mut mac, b"buzz-operator-binding-reference-v1");
         Mac::update(&mut mac, domain.as_uuid().as_bytes());
         Mac::update(&mut mac, &self.epoch.to_be_bytes());
         Mac::update(&mut mac, binding_id.as_bytes());
-        mac.finalize().into_bytes().into()
+        Ok(mac.finalize().into_bytes().into())
     }
 }
 
@@ -344,8 +351,9 @@ impl Db {
         key: &OperatorReferenceKey,
         command: &OperatorLifecycleCommand,
     ) -> std::result::Result<OperatorLifecycleResult, OperatorLifecycleFailure> {
-        validate_command(command)?;
+        let validated_action = validate_command(command)?;
         let mut tx = self.pool.begin().await.map_err(DbError::from)?;
+        set_lifecycle_lock_timeout_tx(&mut tx).await?;
         ensure_revision_tx(&mut tx, command.domain).await?;
         let revision = lock_revision_tx(&mut tx, command.domain).await?;
 
@@ -394,11 +402,19 @@ impl Db {
             return Err(OperatorLifecycleFailure::Denied(reason));
         }
 
-        let outcome = match command.action {
-            OperatorLifecycleAction::List => list_tx(&mut tx, key, command, revision).await?,
-            OperatorLifecycleAction::Preview => preview_tx(&mut tx, command, revision).await?,
-            OperatorLifecycleAction::Revoke => revoke_tx(&mut tx, key, command, revision).await?,
-            OperatorLifecycleAction::Rotate => rotate_tx(&mut tx, key, command, revision).await?,
+        let outcome = match validated_action {
+            ValidatedOperatorAction::List { limit, after } => {
+                list_tx(&mut tx, key, command, revision, limit, after).await?
+            }
+            ValidatedOperatorAction::Preview(rotation) => {
+                preview_tx(&mut tx, command, revision, rotation).await?
+            }
+            ValidatedOperatorAction::Revoke(target) => {
+                revoke_tx(&mut tx, key, command, revision, target).await?
+            }
+            ValidatedOperatorAction::Rotate(rotation) => {
+                rotate_tx(&mut tx, key, command, revision, rotation).await?
+            }
         };
         let outcome = match outcome {
             OperationAttempt::Applied(value) => value,
@@ -419,6 +435,7 @@ impl Db {
     ) -> std::result::Result<(), OperatorLifecycleFailure> {
         validate_denial_attempt(attempt)?;
         let mut tx = self.pool.begin().await.map_err(DbError::from)?;
+        set_lifecycle_lock_timeout_tx(&mut tx).await?;
         ensure_revision_tx(&mut tx, attempt.domain).await?;
         let revision = lock_revision_tx(&mut tx, attempt.domain).await?;
         if let Some(existing_fingerprint) = existing_denial_receipt_tx(&mut tx, attempt).await? {
@@ -444,9 +461,53 @@ enum OperationAttempt {
     Denied(DecisionReason),
 }
 
+#[derive(Clone, Copy)]
+struct ValidatedTarget {
+    reference: [u8; 32],
+    pseudonym: PseudonymousReference,
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedRotation<'a> {
+    target: ValidatedTarget,
+    replacement_reference: [u8; 32],
+    replacement: &'a VerifiedOperatorReplacement,
+}
+
+#[derive(Clone, Copy)]
+struct PlannedLifecycleEffect {
+    target: ValidatedTarget,
+    binding_id: Uuid,
+    previous_version: u64,
+    current_version: u64,
+}
+
+struct RotationPlan<'a> {
+    replacement_reference: [u8; 32],
+    replacement: &'a VerifiedOperatorReplacement,
+    source: BindingRow,
+    replacement_binding_id: Uuid,
+    lifecycle_revision_precondition: u64,
+    effects: [PlannedLifecycleEffect; 1],
+}
+
+impl RotationPlan<'_> {
+    fn affected_count(&self) -> Result<u32> {
+        u32::try_from(self.effects.len())
+            .map_err(|_| DbError::InvalidData("operator affected count exceeded".into()))
+    }
+}
+
+enum ValidatedOperatorAction<'a> {
+    List { limit: u16, after: Option<[u8; 32]> },
+    Preview(ValidatedRotation<'a>),
+    Revoke(ValidatedTarget),
+    Rotate(ValidatedRotation<'a>),
+}
+
 fn validate_command(
     command: &OperatorLifecycleCommand,
-) -> std::result::Result<(), OperatorLifecycleFailure> {
+) -> std::result::Result<ValidatedOperatorAction<'_>, OperatorLifecycleFailure> {
     let mut approver_independence = command.authority.approver_independence_references.clone();
     approver_independence.sort_unstable();
     let invalid_common = command.operation_id.is_nil()
@@ -475,41 +536,7 @@ fn validate_command(
             .approvers
             .iter()
             .any(|value| value.kind() != ReferenceKind::Approver);
-    let invalid_shape = match command.action {
-        OperatorLifecycleAction::List => {
-            command.list_limit == 0
-                || usize::from(command.list_limit) > MAX_RECORDS
-                || command.target_reference.is_some()
-                || command.target_pseudonym.is_some()
-                || command.replacement_reference.is_some()
-                || command.replacement.is_some()
-        }
-        OperatorLifecycleAction::Preview => {
-            command.target_reference.is_none()
-                || command.target_pseudonym.is_none()
-                || command.replacement_reference.is_none()
-                || command.replacement.is_none()
-                || command.list_limit != 1
-                || command.list_after.is_some()
-        }
-        OperatorLifecycleAction::Revoke => {
-            command.target_reference.is_none()
-                || command.target_pseudonym.is_none()
-                || command.replacement_reference.is_some()
-                || command.replacement.is_some()
-                || command.list_limit != 1
-                || command.list_after.is_some()
-        }
-        OperatorLifecycleAction::Rotate => {
-            command.target_reference.is_none()
-                || command.target_pseudonym.is_none()
-                || command.replacement_reference.is_none()
-                || command.replacement.is_none()
-                || command.list_limit != 1
-                || command.list_after.is_some()
-        }
-    };
-    if invalid_common || invalid_shape {
+    if invalid_common {
         return Err(OperatorLifecycleFailure::Denied(
             DecisionReason::EvidenceInvalid,
         ));
@@ -522,14 +549,86 @@ fn validate_command(
             DecisionReason::EvidenceInvalid,
         ));
     }
-    if let Some(replacement) = &command.replacement {
-        if Some(replacement.reference) != command.replacement_reference {
-            return Err(OperatorLifecycleFailure::Denied(
-                DecisionReason::IntentConflict,
-            ));
+    match command.action {
+        OperatorLifecycleAction::List => {
+            if command.list_limit == 0
+                || usize::from(command.list_limit) > MAX_RECORDS
+                || command.target_reference.is_some()
+                || command.target_pseudonym.is_some()
+                || command.replacement_reference.is_some()
+                || command.replacement.is_some()
+            {
+                return Err(OperatorLifecycleFailure::Denied(
+                    DecisionReason::EvidenceInvalid,
+                ));
+            }
+            Ok(ValidatedOperatorAction::List {
+                limit: command.list_limit,
+                after: command.list_after,
+            })
+        }
+        OperatorLifecycleAction::Preview | OperatorLifecycleAction::Rotate => {
+            let (Some(target_reference), Some(target_pseudonym)) =
+                (command.target_reference, command.target_pseudonym)
+            else {
+                return Err(OperatorLifecycleFailure::Denied(
+                    DecisionReason::EvidenceInvalid,
+                ));
+            };
+            let (Some(replacement_reference), Some(replacement)) =
+                (command.replacement_reference, command.replacement.as_ref())
+            else {
+                return Err(OperatorLifecycleFailure::Denied(
+                    DecisionReason::EvidenceInvalid,
+                ));
+            };
+            if command.list_limit != 1 || command.list_after.is_some() {
+                return Err(OperatorLifecycleFailure::Denied(
+                    DecisionReason::EvidenceInvalid,
+                ));
+            }
+            if replacement.reference != replacement_reference {
+                return Err(OperatorLifecycleFailure::Denied(
+                    DecisionReason::IntentConflict,
+                ));
+            }
+            let rotation = ValidatedRotation {
+                target: ValidatedTarget {
+                    reference: target_reference,
+                    pseudonym: target_pseudonym,
+                },
+                replacement_reference,
+                replacement,
+            };
+            if command.action == OperatorLifecycleAction::Preview {
+                Ok(ValidatedOperatorAction::Preview(rotation))
+            } else {
+                Ok(ValidatedOperatorAction::Rotate(rotation))
+            }
+        }
+        OperatorLifecycleAction::Revoke => {
+            let (Some(reference), Some(pseudonym)) =
+                (command.target_reference, command.target_pseudonym)
+            else {
+                return Err(OperatorLifecycleFailure::Denied(
+                    DecisionReason::EvidenceInvalid,
+                ));
+            };
+            if command.replacement_reference.is_some()
+                || command.replacement.is_some()
+                || command.list_limit != 1
+                || command.list_after.is_some()
+            {
+                return Err(OperatorLifecycleFailure::Denied(
+                    DecisionReason::EvidenceInvalid,
+                ));
+            }
+            Ok(ValidatedOperatorAction::Revoke(ValidatedTarget {
+                reference,
+                pseudonym,
+            }))
         }
     }
-    Ok(())
 }
 
 fn validate_denial_attempt(
@@ -552,6 +651,13 @@ fn validate_denial_attempt(
             DecisionReason::EvidenceInvalid,
         ));
     }
+    Ok(())
+}
+
+async fn set_lifecycle_lock_timeout_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query("SET LOCAL lock_timeout = '3s'")
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -728,8 +834,10 @@ async fn list_tx(
     key: &OperatorReferenceKey,
     command: &OperatorLifecycleCommand,
     revision: u64,
+    limit: u16,
+    after: Option<[u8; 32]>,
 ) -> Result<OperationAttempt> {
-    let after_binding = match command.list_after {
+    let after_binding = match after {
         Some(reference) => resolve_binding_id_tx(tx, command.domain, reference).await?,
         None => None,
     };
@@ -740,7 +848,7 @@ async fn list_tx(
     )
     .bind(command.domain.as_uuid())
     .bind(after_binding)
-    .bind(i64::from(command.list_limit))
+    .bind(i64::from(limit))
     .fetch_all(&mut **tx)
     .await?;
     let mut records = Vec::with_capacity(rows.len());
@@ -763,7 +871,7 @@ async fn list_tx(
         lifecycle_revision: revision,
         records,
     };
-    accept_success_tx(tx, command, &result, None, None).await?;
+    accept_success_tx(tx, command, &result, None).await?;
     Ok(OperationAttempt::Applied(result))
 }
 
@@ -771,24 +879,19 @@ async fn preview_tx(
     tx: &mut Transaction<'_, Postgres>,
     command: &OperatorLifecycleCommand,
     revision: u64,
+    input: ValidatedRotation<'_>,
 ) -> Result<OperationAttempt> {
-    let target = command.target_reference.expect("validated preview target");
-    let replacement = command
-        .replacement
-        .as_ref()
-        .expect("validated preview replacement proof");
-    let Some(binding) = resolve_active_binding_tx(tx, command.domain, target).await? else {
-        return Ok(OperationAttempt::Denied(DecisionReason::TargetMismatch));
+    let plan = match plan_rotation_tx(tx, command, revision, input).await? {
+        Ok(plan) => plan,
+        Err(reason) => return Ok(OperationAttempt::Denied(reason)),
     };
-    if replacement_ineligible_tx(tx, command.domain, &binding, &replacement.pubkey).await? {
-        return Ok(OperationAttempt::Denied(DecisionReason::StaleExpectedState));
-    }
+    let affected_count = plan.affected_count()?;
     let result = OperatorLifecycleResult {
         operation_id: command.operation_id,
         correlation_id: command.correlation_id,
         action: command.action,
         status: OperatorLifecycleStatus::Previewed,
-        affected_count: 1,
+        affected_count,
         lifecycle_revision: revision,
         records: Vec::new(),
     };
@@ -800,36 +903,37 @@ async fn preview_tx(
             result: EventResult::Previewed,
             reason: DecisionReason::PreviewOnly,
             payload: None,
-            summary: Some((1, command.semantic_fingerprint)),
+            summary: Some((affected_count, command.semantic_fingerprint)),
             binding_version: None,
             invalidation_generation: None,
         },
     )?;
     let accepted = append_decision_tx(tx, &decision_event, CapacityClass::NonessentialRead).await?;
+    let [effect] = &plan.effects;
     sqlx::query(
         "INSERT INTO authorization_lifecycle_previews \
          (community_id,preview_digest,operation_id,target_reference,replacement_reference, \
           lifecycle_revision,affected_count,expires_at,decision_event_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,1,clock_timestamp()+INTERVAL '5 minutes',$7)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,clock_timestamp()+INTERVAL '5 minutes',$8)",
     )
     .bind(command.domain.as_uuid())
     .bind(command.semantic_fingerprint.as_slice())
     .bind(command.operation_id)
-    .bind(target.as_slice())
-    .bind(
-        command
-            .replacement_reference
-            .expect("validated preview replacement")
-            .as_slice(),
-    )
+    .bind(effect.target.reference.as_slice())
+    .bind(plan.replacement_reference.as_slice())
     .bind(i64_revision(revision)?)
+    .bind(
+        i32::try_from(affected_count)
+            .map_err(|_| DbError::InvalidData("operator affected count is out of range".into()))?,
+    )
     .bind(accepted.event_id.as_uuid())
     .execute(&mut **tx)
     .await?;
-    accept_success_tx(tx, command, &result, None, None).await?;
+    accept_success_tx(tx, command, &result, None).await?;
     Ok(OperationAttempt::Applied(result))
 }
 
+#[derive(PartialEq, Eq)]
 struct BindingRow {
     binding_id: Uuid,
     issuer: String,
@@ -839,14 +943,90 @@ struct BindingRow {
     provenance: String,
 }
 
+async fn plan_rotation_tx<'a>(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &OperatorLifecycleCommand,
+    revision: u64,
+    input: ValidatedRotation<'a>,
+) -> Result<std::result::Result<RotationPlan<'a>, DecisionReason>> {
+    let Some(candidate) =
+        resolve_active_binding_candidate_tx(tx, command.domain, input.target.reference).await?
+    else {
+        return Ok(Err(DecisionReason::TargetMismatch));
+    };
+    lock_identity_coordinates_tx(
+        tx,
+        vec![
+            operation_lock_coordinate(command.domain, command.operation_id),
+            principal_lock_coordinate(command.domain, &candidate.issuer, &candidate.subject),
+            key_lock_coordinate(command.domain, &candidate.pubkey),
+            key_lock_coordinate(command.domain, &input.replacement.pubkey),
+            binding_lock_coordinate(command.domain, candidate.binding_id),
+        ],
+    )
+    .await?;
+    let Some(source) =
+        resolve_active_binding_tx(tx, command.domain, input.target.reference).await?
+    else {
+        return Ok(Err(DecisionReason::StaleExpectedState));
+    };
+    if source != candidate
+        || rotation_ineligible_tx(tx, command.domain, &source, &input.replacement.pubkey).await?
+    {
+        return Ok(Err(DecisionReason::StaleExpectedState));
+    }
+    let current_version = source
+        .version
+        .checked_add(1)
+        .ok_or_else(|| DbError::InvalidData("binding revision exhausted".into()))?;
+    Ok(Ok(RotationPlan {
+        replacement_reference: input.replacement_reference,
+        replacement: input.replacement,
+        effects: [PlannedLifecycleEffect {
+            target: input.target,
+            binding_id: source.binding_id,
+            previous_version: source.version,
+            current_version,
+        }],
+        source,
+        replacement_binding_id: Uuid::new_v4(),
+        lifecycle_revision_precondition: revision,
+    }))
+}
+
+async fn rotation_plan_is_current_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &OperatorLifecycleCommand,
+    plan: &RotationPlan<'_>,
+) -> Result<bool> {
+    if lock_revision_tx(tx, command.domain).await? != plan.lifecycle_revision_precondition {
+        return Ok(false);
+    }
+    let [effect] = &plan.effects;
+    let Some(source) =
+        resolve_active_binding_tx(tx, command.domain, effect.target.reference).await?
+    else {
+        return Ok(false);
+    };
+    if source != plan.source
+        || effect.binding_id != source.binding_id
+        || effect.previous_version != source.version
+        || source.version.checked_add(1) != Some(effect.current_version)
+    {
+        return Ok(false);
+    }
+    Ok(!rotation_ineligible_tx(tx, command.domain, &source, &plan.replacement.pubkey).await?)
+}
+
 async fn revoke_tx(
     tx: &mut Transaction<'_, Postgres>,
     _key: &OperatorReferenceKey,
     command: &OperatorLifecycleCommand,
     revision: u64,
+    target: ValidatedTarget,
 ) -> Result<OperationAttempt> {
-    let target = command.target_reference.expect("validated revoke target");
-    let Some(binding) = resolve_active_binding_tx(tx, command.domain, target).await? else {
+    let Some(binding) = resolve_active_binding_tx(tx, command.domain, target.reference).await?
+    else {
         return Ok(OperationAttempt::Denied(DecisionReason::TargetMismatch));
     };
     if has_pending_lineage_tx(tx, command.domain, &binding).await? {
@@ -856,7 +1036,6 @@ async fn revoke_tx(
         .version
         .checked_add(1)
         .ok_or_else(|| DbError::InvalidData("binding revision exhausted".into()))?;
-    retire_pair_tx(tx, command, &binding, next_version).await?;
     let updated = sqlx::query(
         "UPDATE identity_bindings SET binding_version=$3,binding_state='revoked', \
          revoked_at=clock_timestamp(),revoked_by=$4,revoked_reason=$5, \
@@ -875,11 +1054,13 @@ async fn revoke_tx(
     if updated.rows_affected() != 1 {
         return Ok(OperationAttempt::Denied(DecisionReason::StaleExpectedState));
     }
+    retire_pair_tx(tx, command, &binding, binding.binding_id, next_version).await?;
     insert_pending_tx(tx, command, &binding, next_version).await?;
     append_binding_history_tx(
         tx,
         command,
         &binding,
+        binding.binding_id,
         next_version,
         "revoked",
         "revoke_binding",
@@ -887,6 +1068,12 @@ async fn revoke_tx(
     )
     .await?;
     let lifecycle_revision = advance_revision_tx(tx, command.domain, revision).await?;
+    let effect = PlannedLifecycleEffect {
+        target,
+        binding_id: binding.binding_id,
+        previous_version: binding.version,
+        current_version: next_version,
+    };
     let result = OperatorLifecycleResult {
         operation_id: command.operation_id,
         correlation_id: command.correlation_id,
@@ -896,14 +1083,7 @@ async fn revoke_tx(
         lifecycle_revision,
         records: Vec::new(),
     };
-    accept_success_tx(
-        tx,
-        command,
-        &result,
-        Some((target, binding.version, next_version)),
-        Some(binding.binding_id),
-    )
-    .await?;
+    accept_success_tx(tx, command, &result, Some(effect)).await?;
     Ok(OperationAttempt::Applied(result))
 }
 
@@ -912,21 +1092,33 @@ async fn rotate_tx(
     key: &OperatorReferenceKey,
     command: &OperatorLifecycleCommand,
     revision: u64,
+    input: ValidatedRotation<'_>,
 ) -> Result<OperationAttempt> {
-    let target = command.target_reference.expect("validated rotate target");
-    let replacement = command.replacement.as_ref().expect("validated replacement");
-    let Some(binding) = resolve_active_binding_tx(tx, command.domain, target).await? else {
-        return Ok(OperationAttempt::Denied(DecisionReason::TargetMismatch));
+    let plan = match plan_rotation_tx(tx, command, revision, input).await? {
+        Ok(plan) => plan,
+        Err(reason) => return Ok(OperationAttempt::Denied(reason)),
     };
-    if replacement_ineligible_tx(tx, command.domain, &binding, &replacement.pubkey).await? {
+    if !rotation_plan_is_current_tx(tx, command, &plan).await? {
         return Ok(OperationAttempt::Denied(DecisionReason::StaleExpectedState));
     }
-    let next_version = binding
-        .version
-        .checked_add(1)
-        .ok_or_else(|| DbError::InvalidData("binding revision exhausted".into()))?;
-    let replacement_binding_id = Uuid::new_v4();
-    retire_pair_tx(tx, command, &binding, next_version).await?;
+    apply_rotation_plan_tx(tx, key, command, plan).await
+}
+
+async fn apply_rotation_plan_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &OperatorReferenceKey,
+    command: &OperatorLifecycleCommand,
+    plan: RotationPlan<'_>,
+) -> Result<OperationAttempt> {
+    let affected_count = plan.affected_count()?;
+    let RotationPlan {
+        replacement_reference: _,
+        replacement,
+        source: binding,
+        replacement_binding_id,
+        lifecycle_revision_precondition,
+        effects: [effect],
+    } = plan;
     let updated = sqlx::query(
         "UPDATE identity_bindings SET binding_version=$3,binding_state='rotated', \
          revoked_at=clock_timestamp(),revoked_by=$4,revoked_reason=$5, \
@@ -937,18 +1129,26 @@ async fn rotate_tx(
            AND revoked_at IS NULL AND binding_version=$8",
     )
     .bind(command.domain.as_uuid())
-    .bind(binding.binding_id)
-    .bind(i64_revision(next_version)?)
+    .bind(effect.binding_id)
+    .bind(i64_revision(effect.current_version)?)
     .bind(command.authority.actor.digest().as_slice())
     .bind(reason_code(command.reason_code))
     .bind(replacement.pubkey.as_slice())
     .bind(replacement_binding_id)
-    .bind(i64_revision(binding.version)?)
+    .bind(i64_revision(effect.previous_version)?)
     .execute(&mut **tx)
     .await?;
     if updated.rows_affected() != 1 {
         return Ok(OperationAttempt::Denied(DecisionReason::StaleExpectedState));
     }
+    retire_pair_tx(
+        tx,
+        command,
+        &binding,
+        effect.binding_id,
+        effect.current_version,
+    )
+    .await?;
     let policy = hex::encode(replacement.policy_digest);
     sqlx::query(
         "INSERT INTO identity_bindings \
@@ -970,7 +1170,7 @@ async fn rotate_tx(
          (community_id,predecessor_binding_id,successor_binding_id) VALUES ($1,$2,$3)",
     )
     .bind(command.domain.as_uuid())
-    .bind(binding.binding_id)
+    .bind(effect.binding_id)
     .bind(replacement_binding_id)
     .execute(&mut **tx)
     .await?;
@@ -978,7 +1178,8 @@ async fn rotate_tx(
         tx,
         command,
         &binding,
-        next_version,
+        effect.binding_id,
+        effect.current_version,
         "rotated",
         "rotate",
         Some(replacement_binding_id),
@@ -992,26 +1193,30 @@ async fn rotate_tx(
         version: 1,
         provenance: "provisioned".into(),
     };
-    append_binding_history_tx(tx, command, &replacement_row, 1, "active", "rotate", None).await?;
+    append_binding_history_tx(
+        tx,
+        command,
+        &replacement_row,
+        replacement_binding_id,
+        1,
+        "active",
+        "rotate",
+        None,
+    )
+    .await?;
     let _ = binding_reference_tx(tx, key, command.domain, replacement_binding_id).await?;
-    let lifecycle_revision = advance_revision_tx(tx, command.domain, revision).await?;
+    let lifecycle_revision =
+        advance_revision_tx(tx, command.domain, lifecycle_revision_precondition).await?;
     let result = OperatorLifecycleResult {
         operation_id: command.operation_id,
         correlation_id: command.correlation_id,
         action: command.action,
         status: OperatorLifecycleStatus::Rotated,
-        affected_count: 1,
+        affected_count,
         lifecycle_revision,
         records: Vec::new(),
     };
-    accept_success_tx(
-        tx,
-        command,
-        &result,
-        Some((target, binding.version, next_version)),
-        Some(binding.binding_id),
-    )
-    .await?;
+    accept_success_tx(tx, command, &result, Some(effect)).await?;
     Ok(OperationAttempt::Applied(result))
 }
 
@@ -1132,41 +1337,33 @@ async fn accept_success_tx(
     tx: &mut Transaction<'_, Postgres>,
     command: &OperatorLifecycleCommand,
     result: &OperatorLifecycleResult,
-    lifecycle: Option<([u8; 32], u64, u64)>,
-    binding_id: Option<Uuid>,
+    effect: Option<PlannedLifecycleEffect>,
 ) -> Result<()> {
-    let invalidation_generation = match (lifecycle, binding_id) {
-        (Some((_, _, current)), Some(binding_id)) => {
-            Some(apply_binding_invalidation_tx(tx, command, binding_id, current).await?)
-        }
-        (None, None) => None,
-        _ => {
-            return Err(DbError::InvalidData(
-                "operator lifecycle invalidation target is incomplete".into(),
-            ));
-        }
+    let invalidation_generation = match effect {
+        Some(effect) => Some(
+            apply_binding_invalidation_tx(tx, command, effect.binding_id, effect.current_version)
+                .await?,
+        ),
+        None => None,
     };
-    let effect_id = lifecycle.map(|_| EffectId::generate());
-    let payload = lifecycle
-        .map(|(reference, previous, current)| {
-            let target = command_target_pseudonym(command, reference)?;
-            LifecycleEvidenceV1::new(
-                target,
-                Some(previous),
-                Some(current),
-                None,
-                effect_id,
-                invalidation_generation,
-                None,
-            )
-            .map(EventPayloadV1::Lifecycle)
-            .map_err(|error| DbError::InvalidData(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or(EventPayloadV1::BoundedSummary {
+    let effect_id = effect.map(|_| EffectId::generate());
+    let payload = match effect {
+        Some(effect) => LifecycleEvidenceV1::new(
+            effect.target.pseudonym,
+            Some(effect.previous_version),
+            Some(effect.current_version),
+            None,
+            effect_id,
+            invalidation_generation,
+            None,
+        )
+        .map(EventPayloadV1::Lifecycle)
+        .map_err(|error| DbError::InvalidData(error.to_string())),
+        None => Ok(EventPayloadV1::BoundedSummary {
             count: result.affected_count,
             snapshot_digest: command.semantic_fingerprint,
-        });
+        }),
+    }?;
     let event = operator_event(
         command,
         result.lifecycle_revision,
@@ -1183,7 +1380,7 @@ async fn accept_success_tx(
             reason: DecisionReason::Applied,
             payload: Some(payload),
             summary: None,
-            binding_version: lifecycle.map(|(_, _, current)| current),
+            binding_version: effect.map(|effect| effect.current_version),
             invalidation_generation,
         },
     )?;
@@ -1201,7 +1398,7 @@ async fn accept_success_tx(
         event.event_id(),
     )
     .await?;
-    if let (Some(effect_id), Some((target, _, _))) = (effect_id, lifecycle) {
+    if let (Some(effect_id), Some(effect)) = (effect_id, effect) {
         sqlx::query(
             "INSERT INTO authorization_operator_effects \
              (community_id,effect_id,operation_id,effect_kind,target_reference, \
@@ -1215,7 +1412,7 @@ async fn accept_success_tx(
             OperatorLifecycleAction::Rotate => 2_i16,
             _ => return Err(DbError::InvalidData("unexpected operator effect".into())),
         })
-        .bind(target.as_slice())
+        .bind(effect.target.reference.as_slice())
         .bind(i64_revision(result.lifecycle_revision)?)
         .bind(event.event_id().as_uuid())
         .execute(&mut **tx)
@@ -1314,17 +1511,6 @@ fn operator_event(
         },
         payload,
     ))
-}
-
-fn command_target_pseudonym(
-    command: &OperatorLifecycleCommand,
-    reference: [u8; 32],
-) -> Result<PseudonymousReference> {
-    command
-        .target_reference
-        .filter(|value| *value == reference)
-        .and(command.target_pseudonym)
-        .ok_or_else(|| DbError::InvalidData("operator target evidence mismatch".into()))
 }
 
 async fn insert_receipt_tx(
@@ -1501,7 +1687,9 @@ async fn binding_reference_tx(
     {
         return digest(reference);
     }
-    let reference = key.derive(domain, binding_id);
+    let reference = key
+        .derive(domain, binding_id)
+        .map_err(|error| DbError::InvalidData(error.to_string()))?;
     sqlx::query(
         "INSERT INTO authorization_operator_binding_refs \
          (community_id,binding_reference,binding_id,key_epoch) VALUES ($1,$2,$3,$4)",
@@ -1565,6 +1753,37 @@ async fn resolve_active_binding_tx(
     .transpose()
 }
 
+async fn resolve_active_binding_candidate_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    domain: CommunityId,
+    reference: [u8; 32],
+) -> Result<Option<BindingRow>> {
+    let row = sqlx::query(
+        "SELECT binding.binding_id,binding.issuer,binding.uid,binding.pubkey, \
+                binding.binding_version,binding.binding_provenance \
+         FROM authorization_operator_binding_refs reference \
+         JOIN identity_bindings binding ON binding.community_id=reference.community_id \
+              AND binding.binding_id=reference.binding_id \
+         WHERE reference.community_id=$1 AND reference.binding_reference=$2 \
+           AND binding.binding_state='active' AND binding.revoked_at IS NULL",
+    )
+    .bind(domain.as_uuid())
+    .bind(reference.as_slice())
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|row| {
+        Ok(BindingRow {
+            binding_id: row.try_get("binding_id")?,
+            issuer: row.try_get("issuer")?,
+            subject: row.try_get("uid")?,
+            pubkey: row.try_get("pubkey")?,
+            version: positive_u64(row.try_get("binding_version")?, "binding version")?,
+            provenance: row.try_get("binding_provenance")?,
+        })
+    })
+    .transpose()
+}
+
 async fn has_pending_lineage_tx(
     tx: &mut Transaction<'_, Postgres>,
     domain: CommunityId,
@@ -1581,14 +1800,14 @@ async fn has_pending_lineage_tx(
     .await?)
 }
 
-async fn replacement_denied_tx(
+async fn rotation_state_denied_tx(
     tx: &mut Transaction<'_, Postgres>,
     domain: CommunityId,
     binding: &BindingRow,
     replacement: &[u8; 32],
 ) -> Result<bool> {
-    // Replacement keys are community-global credentials. A retired or revoked
-    // key cannot become fresh merely by moving it to another principal.
+    // Keys are community-global credentials. Neither an ineligible source nor
+    // a retired or revoked replacement can become fresh through rotation.
     Ok(sqlx::query_scalar(
         "SELECT \
            EXISTS(SELECT 1 FROM identity_principals WHERE community_id=$1 \
@@ -1597,22 +1816,25 @@ async fn replacement_denied_tx(
                   AND issuer=$2 AND subject=$3) OR \
            EXISTS(SELECT 1 FROM identity_revoked_keys WHERE community_id=$1 AND pubkey=$4) OR \
            EXISTS(SELECT 1 FROM identity_migration_denied_keys WHERE community_id=$1 AND pubkey=$4) OR \
-           EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$4 \
+           EXISTS(SELECT 1 FROM identity_revoked_keys WHERE community_id=$1 AND pubkey=$5) OR \
+           EXISTS(SELECT 1 FROM identity_migration_denied_keys WHERE community_id=$1 AND pubkey=$5) OR \
+           EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 AND pubkey=$5 \
                   AND binding_state='active' AND revoked_at IS NULL) OR \
            EXISTS(SELECT 1 FROM identity_retired_pairs WHERE community_id=$1 \
-                  AND pubkey=$4) OR \
+                  AND pubkey=$5) OR \
            EXISTS(SELECT 1 FROM identity_bindings WHERE community_id=$1 \
-                  AND pubkey=$4 AND revoked_at IS NOT NULL)",
+                  AND pubkey=$5 AND revoked_at IS NOT NULL)",
     )
     .bind(domain.as_uuid())
     .bind(&binding.issuer)
     .bind(&binding.subject)
+    .bind(&binding.pubkey)
     .bind(replacement.as_slice())
     .fetch_one(&mut **tx)
     .await?)
 }
 
-async fn replacement_ineligible_tx(
+async fn rotation_ineligible_tx(
     tx: &mut Transaction<'_, Postgres>,
     domain: CommunityId,
     binding: &BindingRow,
@@ -1620,13 +1842,14 @@ async fn replacement_ineligible_tx(
 ) -> Result<bool> {
     Ok(binding.pubkey.as_slice() == replacement
         || has_pending_lineage_tx(tx, domain, binding).await?
-        || replacement_denied_tx(tx, domain, binding, replacement).await?)
+        || rotation_state_denied_tx(tx, domain, binding, replacement).await?)
 }
 
 async fn retire_pair_tx(
     tx: &mut Transaction<'_, Postgres>,
     command: &OperatorLifecycleCommand,
     binding: &BindingRow,
+    binding_id: Uuid,
     version: u64,
 ) -> Result<()> {
     sqlx::query(
@@ -1640,7 +1863,7 @@ async fn retire_pair_tx(
     .bind(&binding.issuer)
     .bind(&binding.subject)
     .bind(&binding.pubkey)
-    .bind(binding.binding_id)
+    .bind(binding_id)
     .bind(i64_revision(version)?)
     .bind(command.authority.actor.digest().as_slice())
     .bind(reason_code(command.reason_code))
@@ -1687,6 +1910,7 @@ async fn append_binding_history_tx(
     tx: &mut Transaction<'_, Postgres>,
     command: &OperatorLifecycleCommand,
     binding: &BindingRow,
+    binding_id: Uuid,
     version: u64,
     state: &str,
     transition: &str,
@@ -1699,7 +1923,7 @@ async fn append_binding_history_tx(
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
     )
     .bind(command.domain.as_uuid())
-    .bind(binding.binding_id)
+    .bind(binding_id)
     .bind(i64_revision(version)?)
     .bind(&binding.issuer)
     .bind(&binding.subject)
@@ -1879,6 +2103,329 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct LifecycleCounts {
+        bindings: i64,
+        retired_pairs: i64,
+        pending_replacements: i64,
+        history: i64,
+        lineage: i64,
+        effects: i64,
+        invalidation_domains: i64,
+        invalidation_receipts: i64,
+        invalidation_floors: i64,
+        generic_receipts: i64,
+    }
+
+    impl LifecycleCounts {
+        fn one_active_binding() -> Self {
+            Self {
+                bindings: 1,
+                retired_pairs: 0,
+                pending_replacements: 0,
+                history: 0,
+                lineage: 0,
+                effects: 0,
+                invalidation_domains: 0,
+                invalidation_receipts: 0,
+                invalidation_floors: 0,
+                generic_receipts: 0,
+            }
+        }
+
+        fn one_rotation() -> Self {
+            Self {
+                bindings: 2,
+                retired_pairs: 1,
+                pending_replacements: 0,
+                history: 2,
+                lineage: 1,
+                effects: 1,
+                invalidation_domains: 1,
+                invalidation_receipts: 1,
+                invalidation_floors: 2,
+                generic_receipts: 1,
+            }
+        }
+    }
+
+    async fn lifecycle_counts(pool: &sqlx::PgPool, domain: CommunityId) -> LifecycleCounts {
+        let row: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM identity_bindings WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_retired_pairs WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_pending_replacements WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_binding_history WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM identity_binding_lineage WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM authorization_operator_effects WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM authorization_invalidation_domains WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM authorization_invalidation_receipts WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM authorization_invalidation_floors WHERE community_id=$1), \
+               (SELECT COUNT(*) FROM authorization_operation_receipts WHERE community_id=$1)",
+        )
+        .bind(domain.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("count lifecycle state");
+        LifecycleCounts {
+            bindings: row.0,
+            retired_pairs: row.1,
+            pending_replacements: row.2,
+            history: row.3,
+            lineage: row.4,
+            effects: row.5,
+            invalidation_domains: row.6,
+            invalidation_receipts: row.7,
+            invalidation_floors: row.8,
+            generic_receipts: row.9,
+        }
+    }
+
+    async fn seed_active_binding(
+        fixture: &IsolatedPostgres,
+        key: &OperatorReferenceKey,
+        label: &str,
+        pubkey: [u8; 32],
+    ) -> (CommunityId, Uuid, [u8; 32]) {
+        let domain = CommunityId::from_uuid(Uuid::new_v4());
+        let binding_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id,host) VALUES ($1,$2)")
+            .bind(domain.as_uuid())
+            .bind(format!("{}.{}.o5.test", domain.as_uuid(), label))
+            .execute(&fixture.pool)
+            .await
+            .expect("insert lifecycle test domain");
+        sqlx::query(
+            "INSERT INTO identity_bindings \
+             (community_id,issuer,uid,pubkey,source,binding_id,creation_attribution_kind) \
+             VALUES ($1,$2,$3,$4,'db_binding',$5,'legacy_unknown')",
+        )
+        .bind(domain.as_uuid())
+        .bind(format!("https://{label}.issuer.invalid"))
+        .bind(format!("{label}-subject"))
+        .bind(pubkey.as_slice())
+        .bind(binding_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert lifecycle test binding");
+        let mut tx = fixture.pool.begin().await.expect("begin reference setup");
+        let reference = binding_reference_tx(&mut tx, key, domain, binding_id)
+            .await
+            .expect("derive lifecycle target reference");
+        tx.commit().await.expect("commit reference setup");
+        (domain, binding_id, reference)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rotation_command(
+        pseudonymizer: &Pseudonymizer,
+        domain: CommunityId,
+        action: OperatorLifecycleAction,
+        expected_revision: u64,
+        target: [u8; 32],
+        replacement_reference: [u8; 32],
+        replacement_pubkey: [u8; 32],
+        seed: u8,
+    ) -> OperatorLifecycleCommand {
+        OperatorLifecycleCommand {
+            domain,
+            operation_id: Uuid::new_v4(),
+            correlation_id: Uuid::new_v4(),
+            semantic_fingerprint: [seed; 32],
+            expected_revision,
+            action,
+            reason_code: 1,
+            target_reference: Some(target),
+            target_pseudonym: Some(
+                pseudonymizer
+                    .derive(domain, ReferenceKind::Binding, &target)
+                    .expect("derive lifecycle target pseudonym"),
+            ),
+            replacement_reference: Some(replacement_reference),
+            replacement: Some(
+                VerifiedOperatorReplacement::new(
+                    replacement_reference,
+                    replacement_pubkey,
+                    [77; 32],
+                )
+                .expect("build verified lifecycle replacement"),
+            ),
+            list_limit: 1,
+            list_after: None,
+            authority: authority(pseudonymizer, domain, [97; 32], Some([98; 32])),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SourceKeySelector {
+        Revoked,
+        MigrationDenied,
+    }
+
+    async fn assert_source_key_selector_blocks_rotation(
+        selector: SourceKeySelector,
+        label: &str,
+        source_key: [u8; 32],
+        replacement_key: [u8; 32],
+    ) {
+        let fixture = IsolatedPostgres::migrated(label).await;
+        let reference_key = OperatorReferenceKey::new([43; 32], 1).unwrap();
+        let pseudonymizer =
+            Pseudonymizer::new(PseudonymKey::new([53; 32]).expect("pseudonym key"), 1);
+        let (domain, binding_id, target) =
+            seed_active_binding(&fixture, &reference_key, label, source_key).await;
+        match selector {
+            SourceKeySelector::Revoked => {
+                sqlx::query(
+                    "INSERT INTO identity_revoked_keys (community_id,pubkey,reason) \
+                     VALUES ($1,$2,'legacy active overlap')",
+                )
+                .bind(domain.as_uuid())
+                .bind(source_key.as_slice())
+                .execute(&fixture.pool)
+                .await
+                .expect("insert reachable legacy source-key tombstone");
+            }
+            SourceKeySelector::MigrationDenied => {
+                sqlx::query(
+                    "INSERT INTO identity_migration_denied_keys (community_id,pubkey,reason) \
+                     VALUES ($1,$2,'ambiguous legacy source key')",
+                )
+                .bind(domain.as_uuid())
+                .bind(source_key.as_slice())
+                .execute(&fixture.pool)
+                .await
+                .expect("insert reachable migrated source-key denial");
+            }
+        }
+        let selector_facts: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM identity_revoked_keys \
+                WHERE community_id=$1 AND pubkey=$2), \
+               (SELECT COUNT(*) FROM identity_migration_denied_keys \
+                WHERE community_id=$1 AND pubkey=$2), \
+               (SELECT COUNT(*) FROM identity_revoked_keys \
+                WHERE community_id=$1 AND pubkey=$3), \
+               (SELECT COUNT(*) FROM identity_migration_denied_keys \
+                WHERE community_id=$1 AND pubkey=$3), \
+               (SELECT COUNT(*) FROM identity_bindings \
+                WHERE community_id=$1 AND pubkey=$3), \
+               (SELECT COUNT(*) FROM identity_retired_pairs \
+                WHERE community_id=$1 AND pubkey=$3)",
+        )
+        .bind(domain.as_uuid())
+        .bind(source_key.as_slice())
+        .bind(replacement_key.as_slice())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("inspect source selector and fresh replacement");
+        let baseline = lifecycle_counts(&fixture.pool, domain).await;
+
+        let preview = rotation_command(
+            &pseudonymizer,
+            domain,
+            OperatorLifecycleAction::Preview,
+            1,
+            target,
+            [84; 32],
+            replacement_key,
+            151,
+        );
+        let preview_stale = matches!(
+            fixture
+                .db
+                .execute_operator_lifecycle(&reference_key, &preview)
+                .await,
+            Err(OperatorLifecycleFailure::Denied(
+                DecisionReason::StaleExpectedState
+            ))
+        );
+        let after_preview = lifecycle_counts(&fixture.pool, domain).await;
+        let preview_facts: (String, i64, bool, i64, i64) = sqlx::query_as(
+            "SELECT binding.binding_state,binding.binding_version,binding.revoked_at IS NULL, \
+                    revision.revision, \
+                    (SELECT COUNT(*) FROM authorization_lifecycle_previews \
+                     WHERE community_id=$1) \
+             FROM identity_bindings binding \
+             JOIN authorization_operator_lifecycle_revisions revision \
+               ON revision.community_id=binding.community_id \
+             WHERE binding.community_id=$1 AND binding.binding_id=$2",
+        )
+        .bind(domain.as_uuid())
+        .bind(binding_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("inspect source-key denial after preview");
+
+        let rotate = rotation_command(
+            &pseudonymizer,
+            domain,
+            OperatorLifecycleAction::Rotate,
+            1,
+            target,
+            [84; 32],
+            replacement_key,
+            161,
+        );
+        let rotate_stale = matches!(
+            fixture
+                .db
+                .execute_operator_lifecycle(&reference_key, &rotate)
+                .await,
+            Err(OperatorLifecycleFailure::Denied(
+                DecisionReason::StaleExpectedState
+            ))
+        );
+        let final_counts = lifecycle_counts(&fixture.pool, domain).await;
+        let final_facts: (String, i64, bool, i64, i64) = sqlx::query_as(
+            "SELECT binding.binding_state,binding.binding_version,binding.revoked_at IS NULL, \
+                    revision.revision, \
+                    (SELECT COUNT(*) FROM authorization_lifecycle_previews \
+                     WHERE community_id=$1) \
+             FROM identity_bindings binding \
+             JOIN authorization_operator_lifecycle_revisions revision \
+               ON revision.community_id=binding.community_id \
+             WHERE binding.community_id=$1 AND binding.binding_id=$2",
+        )
+        .bind(domain.as_uuid())
+        .bind(binding_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("inspect source-key denial after rotation");
+
+        fixture.cleanup().await;
+
+        assert_ne!(source_key, replacement_key);
+        assert_eq!(
+            selector_facts,
+            match selector {
+                SourceKeySelector::Revoked => (1, 0, 0, 0, 0, 0),
+                SourceKeySelector::MigrationDenied => (0, 1, 0, 0, 0, 0),
+            },
+            "only the active source key is selected; the replacement stays fresh"
+        );
+        assert_eq!(baseline, LifecycleCounts::one_active_binding());
+        assert_eq!(
+            (
+                preview_stale,
+                after_preview,
+                preview_facts,
+                rotate_stale,
+                final_counts,
+                final_facts,
+            ),
+            (
+                true,
+                LifecycleCounts::one_active_binding(),
+                ("active".into(), 1, true, 1, 0),
+                true,
+                LifecycleCounts::one_active_binding(),
+                ("active".into(), 1, true, 1, 0),
+            ),
+            "source-key selectors deny preview and rotation without lifecycle mutation"
+        );
+    }
+
     #[test]
     fn reference_key_is_domain_and_epoch_separated_and_redacted() {
         let first = OperatorReferenceKey::new([7; 32], 1).unwrap();
@@ -1901,6 +2448,490 @@ mod tests {
         assert!(!lifecycle.contains("JSONB"));
         assert!(lifecycle.contains("authorization_operator_operation_receipts"));
         assert!(previews.contains("authorization_decision_events"));
+    }
+
+    #[tokio::test]
+    async fn postgres_record_denial_lock_timeout_is_bounded_and_atomic() {
+        let fixture = IsolatedPostgres::migrated("operator_denial_timeout").await;
+        let domain = CommunityId::from_uuid(Uuid::new_v4());
+        let operation_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id,host) VALUES ($1,$2)")
+            .bind(domain.as_uuid())
+            .bind(format!(
+                "{}.operator-denial-timeout.o5.test",
+                domain.as_uuid()
+            ))
+            .execute(&fixture.pool)
+            .await
+            .expect("insert denial timeout test domain");
+        sqlx::query(
+            "INSERT INTO authorization_operator_lifecycle_revisions (community_id,revision) \
+             VALUES ($1,1)",
+        )
+        .bind(domain.as_uuid())
+        .execute(&fixture.pool)
+        .await
+        .expect("insert denial timeout lifecycle revision");
+
+        let pseudonymizer =
+            Pseudonymizer::new(PseudonymKey::new([54; 32]).expect("pseudonym key"), 1);
+        let attempt = OperatorLifecycleDenialAttempt {
+            domain,
+            operation_id,
+            correlation_id: Uuid::new_v4(),
+            semantic_fingerprint: [91; 32],
+            expected_revision: 1,
+            action: OperatorLifecycleAction::Revoke,
+            reason_code: 2,
+            actor: pseudonymizer
+                .derive(domain, ReferenceKind::Actor, &[93; 32])
+                .expect("derive denial actor pseudonym"),
+            provenance_reference: [92; 32],
+            approvers: Vec::new(),
+            denial_reason: DecisionReason::EvidenceInvalid,
+        };
+        let mut holder = fixture
+            .pool
+            .begin()
+            .await
+            .expect("begin revision lock holder");
+        let held_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM authorization_operator_lifecycle_revisions \
+             WHERE community_id=$1 FOR UPDATE",
+        )
+        .bind(domain.as_uuid())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("lock exact lifecycle revision row");
+
+        let failure = tokio::time::timeout(
+            Duration::from_secs(8),
+            fixture.db.record_operator_lifecycle_denial(&attempt),
+        )
+        .await
+        .expect("PostgreSQL lock timeout must bound denial recording")
+        .expect_err("revision lock contention must fail closed");
+        assert!(
+            matches!(
+                failure,
+                OperatorLifecycleFailure::Storage(DbError::Sqlx(sqlx::Error::Database(
+                    ref error
+                ))) if error.code().as_deref() == Some("55P03")
+            ),
+            "the held revision row must surface PostgreSQL lock timeout: {failure:?}"
+        );
+        let partial_writes: (i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM authorization_operator_operation_receipts \
+                WHERE community_id=$1 AND operation_id=$2), \
+               (SELECT COUNT(*) FROM authorization_audit_outbox \
+                WHERE community_id=$1 AND operation_id=$2)",
+        )
+        .bind(domain.as_uuid())
+        .bind(operation_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("inspect denial timeout rollback");
+
+        holder
+            .rollback()
+            .await
+            .expect("release revision lock holder");
+        fixture.cleanup().await;
+
+        assert_eq!(held_revision, 1, "the test holds the exact revision row");
+        assert_eq!(
+            partial_writes,
+            (0, 0),
+            "lock timeout must leave no denial receipt or audit outbox event"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_preview_and_rotate_share_impact_and_reject_rotate_back() {
+        let fixture = IsolatedPostgres::migrated("operator_plan").await;
+        let reference_key = OperatorReferenceKey::new([41; 32], 1).unwrap();
+        let pseudonymizer =
+            Pseudonymizer::new(PseudonymKey::new([51; 32]).expect("pseudonym key"), 1);
+        let original_key = [31_u8; 32];
+        let replacement_key = [32_u8; 32];
+        let replacement_reference = [81_u8; 32];
+        let (domain, binding_id, target) =
+            seed_active_binding(&fixture, &reference_key, "plan", original_key).await;
+
+        let preview = rotation_command(
+            &pseudonymizer,
+            domain,
+            OperatorLifecycleAction::Preview,
+            1,
+            target,
+            replacement_reference,
+            replacement_key,
+            61,
+        );
+        let preview_operation_id = preview.operation_id;
+        let previewed = fixture
+            .db
+            .execute_operator_lifecycle(&reference_key, &preview)
+            .await
+            .expect("preview canonical rotation plan");
+        let preview_row: (Vec<u8>, Vec<u8>, i64, i32) = sqlx::query_as(
+            "SELECT target_reference,replacement_reference,lifecycle_revision,affected_count \
+             FROM authorization_lifecycle_previews \
+             WHERE community_id=$1 AND operation_id=$2",
+        )
+        .bind(domain.as_uuid())
+        .bind(preview_operation_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read persisted preview plan");
+        let preview_binding: (String, i64, bool) = sqlx::query_as(
+            "SELECT binding_state,binding_version,revoked_at IS NULL \
+             FROM identity_bindings WHERE community_id=$1 AND binding_id=$2",
+        )
+        .bind(domain.as_uuid())
+        .bind(binding_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("inspect binding after preview");
+        let preview_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM authorization_operator_lifecycle_revisions \
+             WHERE community_id=$1",
+        )
+        .bind(domain.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read lifecycle revision after preview");
+        let preview_lifecycle_counts = lifecycle_counts(&fixture.pool, domain).await;
+
+        let rotate = rotation_command(
+            &pseudonymizer,
+            domain,
+            OperatorLifecycleAction::Rotate,
+            1,
+            target,
+            replacement_reference,
+            replacement_key,
+            71,
+        );
+        let rotate_operation_id = rotate.operation_id;
+        let rotated = fixture
+            .db
+            .execute_operator_lifecycle(&reference_key, &rotate)
+            .await
+            .expect("apply canonical rotation plan");
+        let committed_effects: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM authorization_operator_effects \
+             WHERE community_id=$1 AND operation_id=$2",
+        )
+        .bind(domain.as_uuid())
+        .bind(rotate_operation_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count committed rotation effects");
+        let accepted_receipts: Vec<(i32, i16)> = sqlx::query_as(
+            "SELECT affected_count,decision_reason \
+             FROM authorization_operator_operation_receipts \
+             WHERE community_id=$1 AND operation_id IN ($2,$3) ORDER BY action",
+        )
+        .bind(domain.as_uuid())
+        .bind(preview_operation_id)
+        .bind(rotate_operation_id)
+        .fetch_all(&fixture.pool)
+        .await
+        .expect("read accepted preview and rotate receipts");
+        let successor_reference: Vec<u8> = sqlx::query_scalar(
+            "SELECT reference.binding_reference \
+             FROM authorization_operator_binding_refs reference \
+             JOIN identity_bindings binding \
+               ON binding.community_id=reference.community_id \
+              AND binding.binding_id=reference.binding_id \
+             WHERE binding.community_id=$1 AND binding.pubkey=$2 \
+               AND binding.binding_state='active' AND binding.revoked_at IS NULL",
+        )
+        .bind(domain.as_uuid())
+        .bind(replacement_key.as_slice())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("resolve active successor reference");
+        let successor_reference = digest(successor_reference).expect("valid successor reference");
+
+        let rotate_back_preview = rotation_command(
+            &pseudonymizer,
+            domain,
+            OperatorLifecycleAction::Preview,
+            2,
+            successor_reference,
+            [82; 32],
+            original_key,
+            91,
+        );
+        let rotate_back_preview_id = rotate_back_preview.operation_id;
+        let rotate_back_preview_denied = matches!(
+            fixture
+                .db
+                .execute_operator_lifecycle(&reference_key, &rotate_back_preview)
+                .await,
+            Err(OperatorLifecycleFailure::Denied(
+                DecisionReason::StaleExpectedState
+            ))
+        );
+        let rotate_back = rotation_command(
+            &pseudonymizer,
+            domain,
+            OperatorLifecycleAction::Rotate,
+            2,
+            successor_reference,
+            [82; 32],
+            original_key,
+            101,
+        );
+        let rotate_back_id = rotate_back.operation_id;
+        let rotate_back_denied = matches!(
+            fixture
+                .db
+                .execute_operator_lifecycle(&reference_key, &rotate_back)
+                .await,
+            Err(OperatorLifecycleFailure::Denied(
+                DecisionReason::StaleExpectedState
+            ))
+        );
+        let denied_receipts: Vec<(i32, i16, i64)> = sqlx::query_as(
+            "SELECT affected_count,decision_reason,lifecycle_revision \
+             FROM authorization_operator_operation_receipts \
+             WHERE community_id=$1 AND operation_id IN ($2,$3) ORDER BY action",
+        )
+        .bind(domain.as_uuid())
+        .bind(rotate_back_preview_id)
+        .bind(rotate_back_id)
+        .fetch_all(&fixture.pool)
+        .await
+        .expect("read rejected preview and rotate receipts");
+        let final_binding_states: Vec<(Vec<u8>, String, i64)> = sqlx::query_as(
+            "SELECT pubkey,binding_state,binding_version FROM identity_bindings \
+             WHERE community_id=$1 ORDER BY pubkey",
+        )
+        .bind(domain.as_uuid())
+        .fetch_all(&fixture.pool)
+        .await
+        .expect("read final rotation lineage");
+        let final_facts: (i64, i64) = sqlx::query_as(
+            "SELECT revision, \
+               (SELECT COUNT(*) FROM authorization_lifecycle_previews \
+                WHERE community_id=$1) \
+             FROM authorization_operator_lifecycle_revisions WHERE community_id=$1",
+        )
+        .bind(domain.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read final lifecycle facts");
+        let final_lifecycle_counts = lifecycle_counts(&fixture.pool, domain).await;
+
+        fixture.cleanup().await;
+
+        assert_eq!(previewed.status, OperatorLifecycleStatus::Previewed);
+        assert_eq!(previewed.lifecycle_revision, 1);
+        assert_eq!(preview_binding, ("active".into(), 1, true));
+        assert_eq!(preview_revision, 1);
+        assert_eq!(preview_row.0, target);
+        assert_eq!(preview_row.1, replacement_reference);
+        assert_eq!(preview_row.2, 1);
+        assert_eq!(
+            preview_lifecycle_counts,
+            LifecycleCounts::one_active_binding(),
+            "preview must not commit any lifecycle mutation or invalidation"
+        );
+        assert_eq!(rotated.status, OperatorLifecycleStatus::Rotated);
+        assert_eq!(rotated.lifecycle_revision, 2);
+        assert!(rotate_back_preview_denied);
+        assert!(rotate_back_denied);
+        assert_eq!(denied_receipts.len(), 2);
+        assert!(denied_receipts.iter().all(|row| row.0 == 0 && row.2 == 2));
+        assert_eq!(denied_receipts[0].1, denied_receipts[1].1);
+        assert_eq!(
+            denied_receipts[0].1,
+            DecisionReason::StaleExpectedState.discriminant() as i16
+        );
+        assert_eq!(
+            final_binding_states,
+            vec![
+                (original_key.to_vec(), "rotated".into(), 2),
+                (replacement_key.to_vec(), "active".into(), 1),
+            ]
+        );
+        assert_eq!(final_facts, (2, 1), "denied rotate-back adds no preview");
+        assert_eq!(
+            final_lifecycle_counts,
+            LifecycleCounts::one_rotation(),
+            "rotate-back denials must leave the accepted rotation unchanged"
+        );
+        assert_eq!(accepted_receipts.len(), 2);
+        assert_eq!(accepted_receipts[0].1, accepted_receipts[1].1);
+        assert_eq!(
+            accepted_receipts[0].1,
+            DecisionReason::Applied.discriminant() as i16
+        );
+        assert_eq!(committed_effects, 1, "rotation applies one target effect");
+        assert_eq!(
+            previewed.affected_count, rotated.affected_count,
+            "preview and mutation must report the same planned target impact"
+        );
+        assert_eq!(previewed.affected_count, 1);
+        assert_eq!(
+            rotated.affected_count,
+            u32::try_from(committed_effects).unwrap(),
+            "the result count agrees with the committed target effect"
+        );
+        assert_eq!(
+            preview_row.3,
+            i32::try_from(previewed.affected_count).unwrap()
+        );
+        assert!(
+            accepted_receipts
+                .iter()
+                .all(|row| row.0 == i32::try_from(previewed.affected_count).unwrap()),
+            "preview and mutation receipts retain the same planned affected count"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_revoked_active_source_key_denies_preview_and_rotate() {
+        assert_source_key_selector_blocks_rotation(
+            SourceKeySelector::Revoked,
+            "operator_revoked_source",
+            [41; 32],
+            [42; 32],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_migration_denied_active_source_key_denies_preview_and_rotate() {
+        assert_source_key_selector_blocks_rotation(
+            SourceKeySelector::MigrationDenied,
+            "operator_denied_source",
+            [44; 32],
+            [45; 32],
+        )
+        .await;
+    }
+
+    async fn stale_apply_facts(
+        action: OperatorLifecycleAction,
+        label: &str,
+        source_key: [u8; 32],
+        seed: u8,
+    ) -> (bool, (String, i64, bool), i64, LifecycleCounts) {
+        let fixture = IsolatedPostgres::migrated(label).await;
+        let reference_key = OperatorReferenceKey::new([42; 32], 1).unwrap();
+        let pseudonymizer =
+            Pseudonymizer::new(PseudonymKey::new([52; 32]).expect("pseudonym key"), 1);
+
+        let (domain, binding_id, target) =
+            seed_active_binding(&fixture, &reference_key, label, source_key).await;
+        sqlx::query(
+            "CREATE FUNCTION o5_reject_lifecycle_update() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF OLD.binding_state='active' \
+                  AND NEW.binding_state IN ('rotated','revoked') THEN \
+                 RETURN NULL; \
+               END IF; \
+               RETURN NEW; \
+             END $$",
+        )
+        .execute(&fixture.pool)
+        .await
+        .expect("install deterministic lifecycle CAS fault function");
+        sqlx::query(
+            "CREATE TRIGGER o5_reject_lifecycle_update \
+             BEFORE UPDATE ON identity_bindings FOR EACH ROW \
+             EXECUTE FUNCTION o5_reject_lifecycle_update()",
+        )
+        .execute(&fixture.pool)
+        .await
+        .expect("install deterministic lifecycle CAS fault trigger");
+        let mut command = rotation_command(
+            &pseudonymizer,
+            domain,
+            action,
+            1,
+            target,
+            [83; 32],
+            [source_key[0].wrapping_add(1); 32],
+            seed,
+        );
+        if action == OperatorLifecycleAction::Revoke {
+            command.replacement_reference = None;
+            command.replacement = None;
+        }
+        let denied = matches!(
+            fixture
+                .db
+                .execute_operator_lifecycle(&reference_key, &command)
+                .await,
+            Err(OperatorLifecycleFailure::Denied(
+                DecisionReason::StaleExpectedState
+            ))
+        );
+        let binding: (String, i64, bool) = sqlx::query_as(
+            "SELECT binding_state,binding_version,revoked_at IS NULL \
+             FROM identity_bindings WHERE community_id=$1 AND binding_id=$2",
+        )
+        .bind(domain.as_uuid())
+        .bind(binding_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("inspect binding after stale rotation apply");
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM authorization_operator_lifecycle_revisions \
+             WHERE community_id=$1",
+        )
+        .bind(domain.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read stale-apply lifecycle revision");
+        let counts = lifecycle_counts(&fixture.pool, domain).await;
+
+        fixture.cleanup().await;
+
+        (denied, binding, revision, counts)
+    }
+
+    #[tokio::test]
+    async fn postgres_zero_row_lifecycle_apply_commits_no_partial_plan() {
+        let rotate = stale_apply_facts(
+            OperatorLifecycleAction::Rotate,
+            "operator_stale_rotate",
+            [33; 32],
+            111,
+        )
+        .await;
+        let revoke = stale_apply_facts(
+            OperatorLifecycleAction::Revoke,
+            "operator_stale_revoke",
+            [35; 32],
+            121,
+        )
+        .await;
+        assert_eq!(
+            (rotate, revoke),
+            (
+                (
+                    true,
+                    ("active".into(), 1, true),
+                    1,
+                    LifecycleCounts::one_active_binding(),
+                ),
+                (
+                    true,
+                    ("active".into(), 1, true),
+                    1,
+                    LifecycleCounts::one_active_binding(),
+                ),
+            ),
+            "zero-row rotate and revoke must commit no planned lifecycle side effect"
+        );
     }
 
     #[tokio::test]
