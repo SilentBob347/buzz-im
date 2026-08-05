@@ -377,8 +377,9 @@ impl WebSocketManager {
 
         if let Some((id, handle, epoch, attempt, presentation_token, fresh_until)) = expiry {
             let manager = self.clone();
+            let expires_after = duration_until_unix_second(fresh_until);
             let _ = tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(duration_until_unix_second(fresh_until)).await;
+                tokio::time::sleep(expires_after).await;
                 manager
                     .expire_projection_if_owner(
                         id,
@@ -412,8 +413,7 @@ impl WebSocketManager {
         }) && projection
             .current
             .as_ref()
-            .is_some_and(|current| current.fresh_until == fresh_until)
-            && unix_now() >= fresh_until;
+            .is_some_and(|current| current.fresh_until == fresh_until);
         if !matches_current {
             return;
         }
@@ -1619,6 +1619,36 @@ mod tests {
         let projection = manager.projection.lock().await;
         assert!(projection.owner.is_none());
         assert!(projection.current.is_none());
+    }
+
+    #[tokio::test]
+    async fn matching_monotonic_expiry_clears_when_wall_clock_looks_early() {
+        let manager = WebSocketManager::default();
+        let handle = test_handle(None);
+        let epoch = test_epoch(0x35);
+        let fresh_until = unix_now() + 60;
+        {
+            let mut projection = manager.projection.lock().await;
+            projection.owner = Some(ProjectionOwner {
+                id: 13,
+                handle: handle.clone(),
+                epoch: epoch.clone(),
+                attempt: 2,
+                presentation_token: 3,
+                channel: silent_channel(),
+            });
+            projection.current = Some(CurrentProjection {
+                event_author_pubkey: "22".repeat(32),
+                fresh_until,
+                connection_epoch: epoch.as_str().to_owned(),
+            });
+        }
+
+        assert!(unix_now() < fresh_until, "test models a backward clock");
+        manager
+            .expire_projection_if_owner(13, &handle, &epoch, 2, 3, fresh_until)
+            .await;
+        assert!(manager.projection.lock().await.current.is_none());
     }
 
     #[tokio::test]
