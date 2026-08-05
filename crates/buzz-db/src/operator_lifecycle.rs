@@ -856,7 +856,7 @@ async fn revoke_tx(
     let updated = sqlx::query(
         "UPDATE identity_bindings SET binding_version=$3,binding_state='revoked', \
          revoked_at=clock_timestamp(),revoked_by=$4,revoked_reason=$5, \
-         revocation_scope='binding',updated_at=clock_timestamp() \
+         revocation_scope='key',updated_at=clock_timestamp() \
          WHERE community_id=$1 AND binding_id=$2 AND binding_state='active' \
            AND revoked_at IS NULL AND binding_version=$6",
     )
@@ -2101,8 +2101,8 @@ mod tests {
             ))
         ));
 
-        let state: (String, i64) = sqlx::query_as(
-            "SELECT binding_state,binding_version FROM identity_bindings \
+        let state: (String, i64, String) = sqlx::query_as(
+            "SELECT binding_state,binding_version,revocation_scope FROM identity_bindings \
              WHERE community_id=$1 AND binding_id=$2",
         )
         .bind(domain.as_uuid())
@@ -2110,7 +2110,7 @@ mod tests {
         .fetch_one(&fixture.pool)
         .await
         .expect("inspect revoked binding");
-        assert_eq!(state, ("revoked".into(), 2));
+        assert_eq!(state, ("revoked".into(), 2, "key".into()));
         let receipt_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM authorization_operator_operation_receipts WHERE community_id=$1",
         )

@@ -129,13 +129,6 @@ CREATE TABLE authorization_operator_effects (
         ON DELETE RESTRICT
 );
 
-ALTER TABLE identity_bindings
-    DROP CONSTRAINT identity_bindings_revocation_scope_check;
-ALTER TABLE identity_bindings
-    ADD CONSTRAINT identity_bindings_revocation_scope_check CHECK (
-        revocation_scope IN ('principal', 'key', 'rotation', 'binding')
-    );
-
 ALTER TABLE identity_binding_history
     DROP CONSTRAINT identity_binding_history_transition_kind_check;
 ALTER TABLE identity_binding_history
