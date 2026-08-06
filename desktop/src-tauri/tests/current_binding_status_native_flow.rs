@@ -61,7 +61,7 @@ mod native_websocket {
 
     pub(super) async fn current_projection_for_test(
         manager: &WebSocketManager,
-    ) -> Option<CurrentProjection> {
+    ) -> Option<crate::client_binding_status_session::CurrentProjection> {
         manager.projection.lock().await.current.clone()
     }
 

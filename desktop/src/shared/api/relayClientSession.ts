@@ -1,9 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import {
-  createAuthEvent,
-  getRelayWsUrl,
-  signRelayEvent,
-} from "@/shared/api/tauri";
+import { getRelayWsUrl, signRelayEvent } from "@/shared/api/tauri";
 import type { PresenceStatus, RelayEvent } from "@/shared/api/types";
 import {
   KIND_STREAM_MESSAGE,
@@ -67,18 +63,8 @@ import {
 } from "@/shared/api/relayClientTimings";
 import { closeWebSocket } from "@/shared/api/relayWebSocketClose";
 import { AuthOkTracker } from "@/shared/api/relayAuthPolicy";
+import { RelayClientStatusConnection } from "@/shared/api/relayClientStatusConnection";
 import { buildThreadReferenceTags } from "@/features/messages/lib/threading";
-import {
-  clearCurrentProjection,
-  createCurrentProjectionChannel,
-  type CurrentProjection,
-} from "@/features/binding-status/currentProjectionStore";
-
-type NativeSocketBinding = Readonly<{
-  id: number;
-  relayUrl: string;
-}>;
-
 export class RelayClient {
   private wsId: number | null = null;
   private relayUrl: string | null = null;
@@ -101,7 +87,7 @@ export class RelayClient {
   private hasConnectedOnce = false;
   private notifyReconnectListeners = false;
   private onMessageChannel: Channel<unknown> | null = null;
-  private onProjectionChannel: Channel<CurrentProjection | null> | null = null;
+  private statusConnection: RelayClientStatusConnection | null = null;
   private connectionGeneration = 0;
   private stabilityTimer: number | null = null;
   private visibleChannelId: string | null = null;
@@ -183,8 +169,8 @@ export class RelayClient {
     this.reconnectListeners.clear();
     this.connectionStateEmitter.clear();
     this.onMessageChannel = null;
-    this.onProjectionChannel = null;
-    clearCurrentProjection();
+    this.statusConnection?.retire();
+    this.statusConnection = null;
     this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
   }
 
@@ -542,29 +528,13 @@ export class RelayClient {
       window.clearTimeout(this.stabilityTimer);
       this.stabilityTimer = null;
     }
-
     this.connectionStateEmitter.set(
       this.hasConnectedOnce ? "reconnecting" : "connecting",
     );
-
     const generation = ++this.connectionGeneration;
-    let nativeWebsocketId: number | null = null;
-    let resolveNativeSocketBinding!: (
-      binding: NativeSocketBinding | null,
-    ) => void;
-    const nativeSocketBinding = new Promise<NativeSocketBinding | null>(
-      (resolve) => {
-        resolveNativeSocketBinding = resolve;
-      },
-    );
-    let nativeSocketBindingSettled = false;
-    const settleNativeSocketBinding = (binding: NativeSocketBinding | null) => {
-      if (nativeSocketBindingSettled) return;
-      nativeSocketBindingSettled = true;
-      resolveNativeSocketBinding(binding);
-    };
+    let statusConnection!: RelayClientStatusConnection;
     this.onMessageChannel = new Channel<unknown>((message) => {
-      void this.handleWsMessage(message, generation, nativeSocketBinding).catch(
+      void this.handleWsMessage(message, generation, statusConnection).catch(
         (error) => {
           if (generation !== this.connectionGeneration) return;
           this.resetConnection(
@@ -573,40 +543,37 @@ export class RelayClient {
         },
       );
     });
-    let onProjectionChannel: Channel<CurrentProjection | null>;
-    onProjectionChannel = createCurrentProjectionChannel(
-      () =>
+    statusConnection = new RelayClientStatusConnection(
+      (id) =>
         generation === this.connectionGeneration &&
-        nativeWebsocketId !== null &&
-        this.wsId === nativeWebsocketId &&
-        this.onProjectionChannel === onProjectionChannel,
+        this.wsId === id &&
+        this.statusConnection === statusConnection,
+      (id) =>
+        generation === this.connectionGeneration &&
+        this.wsId === id &&
+        this.authRequest !== null,
+      (eventId) => {
+        if (this.authRequest) this.authRequest.pendingEventId = eventId;
+      },
+      (event) => this.sendRaw(["AUTH", event]),
     );
-    this.onProjectionChannel = onProjectionChannel;
-    clearCurrentProjection();
-
+    this.statusConnection = statusConnection;
     try {
       if (!this.relayUrl) {
         this.relayUrl = await getRelayWsUrl();
       }
       const connectionRelayUrl = this.relayUrl;
-      const wsId = await invoke<number>(
-        "plugin:websocket|connect_with_status",
-        {
-          url: connectionRelayUrl,
-          onMessage: this.onMessageChannel,
-          onProjection: onProjectionChannel,
-          config: {},
-        },
+      const wsId = await statusConnection.connect(
+        connectionRelayUrl,
+        this.onMessageChannel,
       );
       if (generation !== this.connectionGeneration) {
-        settleNativeSocketBinding(null);
+        statusConnection.retire();
         void closeWebSocket(wsId, "stale connection attempt");
         throw new Error("Relay connection attempt was superseded.");
       }
-      nativeWebsocketId = wsId;
       this.wsId = wsId;
-      settleNativeSocketBinding({ id: wsId, relayUrl: connectionRelayUrl });
-
+      statusConnection.bind(wsId, connectionRelayUrl);
       await new Promise<void>((resolve, reject) => {
         const timeout = window.setTimeout(() => {
           const error = new Error("Relay authentication timed out.");
@@ -614,7 +581,6 @@ export class RelayClient {
           this.resetConnection(error);
           reject(error);
         }, AUTH_TIMEOUT_MS);
-
         this.authRequest = {
           pendingEventId: "",
           resolve,
@@ -622,18 +588,16 @@ export class RelayClient {
           timeout,
         };
       });
-
       this.stabilityTimer = window.setTimeout(() => {
         this.stabilityTimer = null;
         this.reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
       }, BACKOFF_RESET_STABLE_MS);
-
       this.connectionStateEmitter.set("connected");
       await this.replayLiveSubscriptions();
       this.stallWatchdog.start();
       this.emitReconnectIfNeeded();
     } catch (error) {
-      settleNativeSocketBinding(null);
+      statusConnection.retire();
       const connectionError = this.normalizeRelayError(
         error,
         "Failed to connect to relay.",
@@ -644,7 +608,6 @@ export class RelayClient {
       throw connectionError;
     }
   }
-
   private async subscribe(
     filter: RelaySubscriptionFilter,
     onEvent: (event: RelayEvent) => void,
@@ -805,7 +768,7 @@ export class RelayClient {
   private async handleWsMessage(
     message: unknown,
     generation: number,
-    nativeSocketBinding: Promise<NativeSocketBinding | null>,
+    statusConnection: RelayClientStatusConnection,
   ) {
     if (generation !== this.connectionGeneration) return;
     this.stallWatchdog.recordInbound();
@@ -839,9 +802,7 @@ export class RelayClient {
 
     const [type, ...rest] = data;
     if (type === "AUTH" && typeof rest[0] === "string") {
-      const binding = await nativeSocketBinding;
-      if (!binding || generation !== this.connectionGeneration) return;
-      await this.handleAuthChallenge(rest[0], generation, binding);
+      await statusConnection.handleAuthChallenge(rest[0]);
       return;
     }
     if (type === "EVENT" && typeof rest[0] === "string" && rest[1]) {
@@ -888,29 +849,6 @@ export class RelayClient {
         activateRateLimit(parseRateLimitHint(notice));
       }
     }
-  }
-
-  private async handleAuthChallenge(
-    challenge: string,
-    generation: number,
-    nativeSocketBinding: NativeSocketBinding,
-  ) {
-    const event = await createAuthEvent({
-      challenge,
-      nativeWebsocketId: nativeSocketBinding.id,
-      relayUrl: nativeSocketBinding.relayUrl,
-    });
-
-    if (
-      generation !== this.connectionGeneration ||
-      this.wsId !== nativeSocketBinding.id ||
-      !this.authRequest
-    ) {
-      return;
-    }
-
-    this.authRequest.pendingEventId = event.id;
-    await this.sendRaw(["AUTH", event]);
   }
 
   private handleEvent(subId: string, event: RelayEvent) {
@@ -1074,8 +1012,8 @@ export class RelayClient {
     },
   ) {
     this.onMessageChannel = null;
-    this.onProjectionChannel = null;
-    clearCurrentProjection();
+    this.statusConnection?.retire();
+    this.statusConnection = null;
     this.stallWatchdog.stop();
     this.connectionGeneration++;
     if (this.stabilityTimer !== null) {
@@ -1146,5 +1084,4 @@ export class RelayClient {
       this.scheduleReconnect();
     }
   }
-
 }
