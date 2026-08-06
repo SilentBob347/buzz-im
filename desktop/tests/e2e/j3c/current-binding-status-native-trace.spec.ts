@@ -13,6 +13,7 @@ import {
 const trace = loadCurrentBindingStatusTrace();
 const LEGACY_VERIFIED_NAME_MARKER = "legacy-verified-name-must-not-authorize";
 const LEGACY_ALIAS_MARKER = "legacy-relay-alias-must-not-authorize";
+const PROJECTION_SETUP_HEADROOM_SECONDS = 60;
 
 async function waitForMockLiveSubscription(page: Page) {
   await expect
@@ -113,7 +114,8 @@ test("Rust native-flow trace drives exact-author lifecycle presentation", async 
   if (activationProjection === null) {
     throw new Error("Native current trace step must contain a projection.");
   }
-  const clockStartSeconds = expiryProjection.freshUntil - 2;
+  const clockStartSeconds =
+    expiryProjection.freshUntil - PROJECTION_SETUP_HEADROOM_SECONDS;
   if (clockStartSeconds <= 0) {
     throw new Error(
       "Native trace freshUntil is too small for expiry coverage.",
