@@ -3,9 +3,11 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { installMockBridge, TEST_IDENTITIES } from "../../helpers/bridge";
 import {
   forwardTraceStep,
+  installNativeProjectionTraceAdapter,
   loadCurrentBindingStatusTrace,
   traceStep,
   type NativeCurrentProjection,
+  waitForNativeProjectionTraceAdapter,
 } from "./currentBindingStatusTrace";
 
 const trace = loadCurrentBindingStatusTrace();
@@ -23,25 +25,6 @@ async function waitForMockLiveSubscription(page: Page) {
       ),
     )
     .toBe(true);
-}
-
-async function waitForProjectionBridgeBootstrap(page: Page) {
-  await expect
-    .poll(() =>
-      page.evaluate(() =>
-        window.__BUZZ_E2E_COMMANDS__?.includes(
-          "get_current_binding_projection",
-        ),
-      ),
-    )
-    .toBe(true);
-
-  await page.evaluate(
-    () =>
-      new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
-      }),
-  );
 }
 
 function otherSyntheticAuthor(projectedAuthors: ReadonlySet<string>): string {
@@ -145,11 +128,12 @@ test("Rust native-flow trace drives exact-author lifecycle presentation", async 
       nip05Handle: `${LEGACY_ALIAS_MARKER}-${index}@example.invalid`,
     })),
   });
+  await installNativeProjectionTraceAdapter(page);
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await waitForMockLiveSubscription(page);
-  await waitForProjectionBridgeBootstrap(page);
+  await waitForNativeProjectionTraceAdapter(page);
 
   const rows = new Map<string, Locator>();
   let createdAt = clockStartSeconds - projectedAuthors.size - 1;

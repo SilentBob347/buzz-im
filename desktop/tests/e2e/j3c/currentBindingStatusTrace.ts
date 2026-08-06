@@ -3,11 +3,12 @@ import { isAbsolute } from "node:path";
 
 import type { Page } from "@playwright/test";
 
-import { CURRENT_PROJECTION_EVENT } from "../../../src/features/binding-status/CurrentProjectionBridge";
 import type { CurrentProjection } from "../../../src/features/binding-status/currentProjectionStore";
 
 const TRACE_ENV = "BUZZ_J3C_PROJECTION_TRACE";
 const LOWERCASE_HEX_256 = /^[0-9a-f]{64}$/;
+const CANONICAL_UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export const CURRENT_BINDING_TRACE_CASES = [
   "bootstrap",
@@ -84,7 +85,7 @@ function isCurrentProjection(value: unknown): value is NativeCurrentProjection {
     Number.isSafeInteger(value.freshUntil) &&
     value.freshUntil > 0 &&
     typeof value.connectionEpoch === "string" &&
-    LOWERCASE_HEX_256.test(value.connectionEpoch)
+    CANONICAL_UUID_V4.test(value.connectionEpoch)
   );
 }
 
@@ -160,19 +161,125 @@ export function traceStep(
   return step;
 }
 
+export async function installNativeProjectionTraceAdapter(
+  page: Page,
+): Promise<void> {
+  await page.addInitScript(() => {
+    type Invoke = (
+      command: string,
+      args: Record<string, unknown>,
+      options: unknown,
+    ) => unknown;
+    type ProjectionChannel = {
+      onmessage: (projection: unknown) => void;
+    };
+    type TraceAdapterWindow = typeof window & {
+      __TAURI_INTERNALS__?: Record<string, unknown>;
+      __BUZZ_J3C_FORWARD_NATIVE_PROJECTION__?: (projection: unknown) => void;
+      __BUZZ_J3C_STATUS_AUTH_BOUND__?: () => boolean;
+    };
+
+    const tauriWindow = window as TraceAdapterWindow;
+    const internals = tauriWindow.__TAURI_INTERNALS__ ?? {};
+    let sharedInvoke =
+      typeof internals.invoke === "function"
+        ? (internals.invoke as Invoke)
+        : null;
+    let projectionChannel: ProjectionChannel | null = null;
+    let statusSocketId: number | null = null;
+    let authBound = false;
+
+    const invoke: Invoke = (command, args, options) => {
+      if (!sharedInvoke) {
+        throw new Error(`Shared mock bridge is not installed for ${command}.`);
+      }
+
+      if (command === "plugin:websocket|connect_with_status") {
+        const { onProjection, ...ordinaryArgs } = args as {
+          onProjection?: ProjectionChannel;
+        } & Record<string, unknown>;
+        if (typeof onProjection?.onmessage !== "function") {
+          throw new Error(
+            "Status connection omitted its native projection Channel.",
+          );
+        }
+
+        authBound = false;
+        projectionChannel = onProjection;
+        statusSocketId = null;
+        return Promise.resolve(
+          sharedInvoke("plugin:websocket|connect", ordinaryArgs, options),
+        ).then((id) => {
+          if (typeof id !== "number" || !Number.isSafeInteger(id)) {
+            throw new Error(
+              "Shared mock bridge returned an invalid socket ID.",
+            );
+          }
+          statusSocketId = id;
+          return id;
+        });
+      }
+
+      if (command === "create_auth_event") {
+        if (
+          statusSocketId === null ||
+          args.nativeWebsocketId !== statusSocketId
+        ) {
+          throw new Error(
+            "Auth event is not bound to the current native status socket ID.",
+          );
+        }
+        authBound = true;
+      }
+
+      return sharedInvoke(command, args, options);
+    };
+
+    Object.defineProperty(internals, "invoke", {
+      configurable: true,
+      get: () => invoke,
+      set: (nextInvoke: Invoke) => {
+        sharedInvoke = nextInvoke;
+      },
+    });
+    tauriWindow.__TAURI_INTERNALS__ = internals;
+    tauriWindow.__BUZZ_J3C_STATUS_AUTH_BOUND__ = () => authBound;
+    tauriWindow.__BUZZ_J3C_FORWARD_NATIVE_PROJECTION__ = (projection) => {
+      if (!authBound || statusSocketId === null || !projectionChannel) {
+        throw new Error(
+          "Native status projection Channel is not authenticated.",
+        );
+      }
+      projectionChannel.onmessage(projection);
+    };
+  });
+}
+
+export async function waitForNativeProjectionTraceAdapter(
+  page: Page,
+): Promise<void> {
+  await page.waitForFunction(
+    () =>
+      (
+        window as typeof window & {
+          __BUZZ_J3C_STATUS_AUTH_BOUND__?: () => boolean;
+        }
+      ).__BUZZ_J3C_STATUS_AUTH_BOUND__?.() === true,
+  );
+}
+
 export async function forwardTraceStep(
   page: Page,
   step: CurrentBindingTraceStep,
 ): Promise<void> {
-  await page.evaluate(
-    async ({ eventName, projection }) => {
-      const emit = window.__BUZZ_E2E_EMIT_TAURI_EVENT__;
-      if (!emit) throw new Error("Mock Tauri event bridge is not installed.");
-      await emit(eventName, projection);
-    },
-    {
-      eventName: CURRENT_PROJECTION_EVENT,
-      projection: step.projection,
-    },
-  );
+  await page.evaluate((projection) => {
+    const forward = (
+      window as typeof window & {
+        __BUZZ_J3C_FORWARD_NATIVE_PROJECTION__?: (projection: unknown) => void;
+      }
+    ).__BUZZ_J3C_FORWARD_NATIVE_PROJECTION__;
+    if (!forward)
+      throw new Error("Native projection adapter is not installed.");
+    forward(projection);
+  }, step.projection);
 }
