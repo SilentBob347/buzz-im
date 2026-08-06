@@ -321,7 +321,7 @@ impl WebSocketManager {
         if let Some((id, handle, epoch, attempt, presentation_token, fresh_until)) = expiry {
             let manager = self.clone();
             let expires_at = monotonic_deadline_after(duration_until_unix_second(fresh_until));
-            let _ = tauri::async_runtime::spawn(async move {
+            std::mem::drop(tauri::async_runtime::spawn(async move {
                 status_expiry_sleep(expires_at).await;
                 manager
                     .expire_projection_if_owner(
@@ -333,7 +333,7 @@ impl WebSocketManager {
                         fresh_until,
                     )
                     .await;
-            });
+            }));
         }
     }
 

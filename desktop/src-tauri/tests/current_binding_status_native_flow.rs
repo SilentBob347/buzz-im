@@ -46,6 +46,7 @@ mod egress_guard {
     }
 }
 
+#[allow(dead_code)]
 mod native_websocket {
     include!("../src/native_websocket.rs");
 

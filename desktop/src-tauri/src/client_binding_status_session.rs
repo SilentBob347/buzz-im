@@ -100,6 +100,7 @@ impl ClientBindingStatusSession {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn projected_fresh_until(&self) -> Option<u64> {
         self.projected_fresh_until
     }
