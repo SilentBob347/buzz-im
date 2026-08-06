@@ -17,6 +17,8 @@ const READ_ONLY_RELAY_CLIENT: &str =
     include_str!("../../../desktop/src/shared/api/readOnlyRelayClient.ts");
 const PRIMARY_RELAY_CLIENT: &str =
     include_str!("../../../desktop/src/shared/api/relayClientSession.ts");
+const STATUS_RELAY_CLIENT: &str =
+    include_str!("../../../desktop/src/shared/api/relayClientStatusConnection.ts");
 const NATIVE_WEBSOCKET: &str = include_str!("../../../desktop/src-tauri/src/native_websocket.rs");
 const DESKTOP_BUILD: &str = include_str!("../../../desktop/src-tauri/build.rs");
 const WORKSPACE_COMMAND: &str =
@@ -327,9 +329,18 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
                 continue;
             }
             let source = fs::read_to_string(&file).expect("source file is readable");
+            let native_socket_tests =
+                file == repo.join("desktop/src-tauri/src/native_websocket_tests.rs");
+            if native_socket_tests {
+                assert!(NATIVE_WEBSOCKET
+                    .contains("#[cfg(test)]\n#[path = \"native_websocket_tests.rs\"]\nmod tests;"));
+                continue;
+            }
             let native_session =
                 file == repo.join("desktop/src-tauri/src/client_binding_status_session.rs");
             let native_socket = file == repo.join("desktop/src-tauri/src/native_websocket.rs");
+            let native_socket_status =
+                file == repo.join("desktop/src-tauri/src/native_websocket_status.rs");
             let native_module_declaration = file == repo.join("desktop/src-tauri/src/lib.rs");
             if native_module_declaration {
                 assert_eq!(
@@ -350,12 +361,19 @@ fn status_uses_only_the_dedicated_authenticated_production_path() {
                 "24244",
                 "deliver_verification_only",
             ] {
-                let expected_native_count = match (native_session, native_socket, forbidden) {
-                    (true, false, "KIND_CLIENT_BINDING_STATUS") => Some(1),
-                    (true, false, "ClientBindingStatus") => Some(33),
-                    (true, false, "client_binding_status") => Some(2),
-                    (false, true, "ClientBindingStatus") => Some(5),
-                    (false, true, "client_binding_status") => Some(1),
+                let expected_native_count = match (
+                    native_session,
+                    native_socket,
+                    native_socket_status,
+                    forbidden,
+                ) {
+                    (true, false, false, "KIND_CLIENT_BINDING_STATUS") => Some(1),
+                    (true, false, false, "ClientBindingStatus") => Some(33),
+                    (true, false, false, "client_binding_status") => Some(2),
+                    (false, true, false, "ClientBindingStatus") => Some(2),
+                    (false, true, false, "client_binding_status") => Some(1),
+                    (false, false, true, "ClientBindingStatus") => Some(3),
+                    (false, false, true, "client_binding_status") => Some(1),
                     _ => None,
                 };
                 if let Some(expected) = expected_native_count {
@@ -463,7 +481,7 @@ fn auth_bootstrap_precedes_status_and_success_ack() {
 }
 
 #[test]
-fn native_status_connect_is_dedicated_and_primary_composition_remains_pending() {
+fn native_status_connect_is_dedicated_and_primary_composition_is_bound() {
     let ordinary = NATIVE_WEBSOCKET
         .split("async fn connect(")
         .nth(1)
@@ -481,12 +499,14 @@ fn native_status_connect_is_dedicated_and_primary_composition_remains_pending() 
     assert!(NATIVE_WEBSOCKET.contains("connect_with_status,"));
     assert!(DESKTOP_BUILD.contains("\"connect_with_status\""));
 
-    // J0/J2 composition remains HOLD until the primary session opts into the
-    // dedicated seam and passes its returned native ID through NIP-42 AUTH.
-    assert!(PRIMARY_RELAY_CLIENT.contains("plugin:websocket|connect"));
-    assert!(!PRIMARY_RELAY_CLIENT.contains("plugin:websocket|connect_with_status"));
-    assert!(!PRIMARY_RELAY_CLIENT.contains("onProjection"));
-    assert!(!PRIMARY_RELAY_CLIENT.contains("nativeWebsocketId"));
+    assert!(PRIMARY_RELAY_CLIENT.contains("RelayClientStatusConnection"));
+    assert!(PRIMARY_RELAY_CLIENT.contains("statusConnection.connect("));
+    assert!(PRIMARY_RELAY_CLIENT.contains("statusConnection.bind(wsId, connectionRelayUrl);"));
+    assert!(PRIMARY_RELAY_CLIENT.contains("statusConnection.handleAuthChallenge(rest[0])"));
+    assert!(STATUS_RELAY_CLIENT.contains("\"plugin:websocket|connect_with_status\""));
+    assert!(!STATUS_RELAY_CLIENT.contains("\"plugin:websocket|connect\""));
+    assert!(STATUS_RELAY_CLIENT.contains("onProjection: this.projectionChannel"));
+    assert!(STATUS_RELAY_CLIENT.contains("nativeWebsocketId: binding.id"));
 }
 
 #[test]
