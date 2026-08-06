@@ -1,7 +1,7 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
 use futures_util::{SinkExt, StreamExt};
 use nostr::PublicKey;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tauri::{ipc::Channel, plugin::TauriPlugin, Manager, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{
@@ -13,13 +13,13 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-use buzz_core_pkg::client_binding_bootstrap::ClientBindingEpoch;
 use crate::{
     app_state::AppState,
     client_binding_status_session::{
         is_reserved_text, ClientBindingStatusSession, ProjectionUpdate,
     },
 };
+use buzz_core_pkg::client_binding_bootstrap::ClientBindingEpoch;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -27,11 +27,11 @@ const SEND_QUEUE_CAPACITY: usize = 64;
 #[path = "native_websocket_status.rs"]
 mod native_websocket_status;
 
+pub(crate) use native_websocket_status::StatusAuthProof;
 use native_websocket_status::{
     duration_until_unix_second, monotonic_deadline_after, prepare_status_session,
     status_expiry_sleep, unix_now, PreparedStatus, ProjectionOwner, ProjectionState, StatusScope,
 };
-pub(crate) use native_websocket_status::StatusAuthProof;
 pub(crate) fn install_crypto_provider() {
     // Dependencies enable both rustls providers; choose one before TLS setup.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -961,7 +961,6 @@ fn nip42_challenge(text: &str) -> Option<String> {
     }
     values.get(1)?.as_str().map(str::to_owned)
 }
-
 
 fn outbound_message(message: Message) -> OutboundMessage {
     match message {

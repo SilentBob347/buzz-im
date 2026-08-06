@@ -164,6 +164,7 @@ async fn production_outbound_bytes_cross_loopback_into_native_status_session() {
         .expect("loopback WebSocket client connects");
     let mut session =
         ClientBindingStatusSession::new(relay.public_key(), author.public_key(), epoch.clone());
+    assert_eq!(session.connection_epoch(), &epoch);
 
     let bootstrap =
         ClientBindingBootstrapInputV1::new(domain, author.public_key(), epoch.clone(), now)
@@ -259,6 +260,8 @@ async fn production_outbound_bytes_cross_loopback_into_native_status_session() {
         &epoch,
         fresh_until,
     );
+    assert!(matches!(session.disconnect(), ProjectionUpdate::Clear));
+    assert_eq!(session.projected_fresh_until(), None);
 
     cancel.cancel();
     timeout(Duration::from_secs(2), server)

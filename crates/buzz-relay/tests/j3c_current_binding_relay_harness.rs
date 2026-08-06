@@ -1153,22 +1153,25 @@ async fn relay_authenticated_status_uses_real_loopback_and_exact_connection_scop
     assert_eq!(restarted.high_water_revision(), None);
     let restarted_session =
         ClientBindingStatusSession::new(relay.public_key(), author.public_key(), epoch.clone());
+    assert_eq!(restarted_session.connection_epoch(), &epoch);
     assert_eq!(restarted_session.projected_fresh_until(), None);
 
     assert_eq!(revisions.current_reads.load(Ordering::SeqCst), 5);
     assert_eq!(revisions.withdrawal_reads.load(Ordering::SeqCst), 1);
-    let observed_scopes = revisions
-        .scopes
-        .lock()
-        .expect("synthetic revision scope lock");
-    assert!(
-        !observed_scopes.is_empty(),
-        "issuer must read durable scope"
-    );
-    assert!(observed_scopes.iter().all(|scope| {
-        scope.authorization_domain() == domain && scope.event_author_pubkey() == author.public_key()
-    }));
-    drop(observed_scopes);
+    {
+        let observed_scopes = revisions
+            .scopes
+            .lock()
+            .expect("synthetic revision scope lock");
+        assert!(
+            !observed_scopes.is_empty(),
+            "issuer must read durable scope"
+        );
+        assert!(observed_scopes.iter().all(|scope| {
+            scope.authorization_domain() == domain
+                && scope.event_author_pubkey() == author.public_key()
+        }));
+    }
 
     connections.deregister(connection_id);
     drop(expected_frame_tx);

@@ -175,7 +175,6 @@ pub(super) fn is_loopback_url(url: &Url) -> bool {
     }
 }
 
-
 pub(super) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
