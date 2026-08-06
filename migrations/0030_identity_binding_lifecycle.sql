@@ -1,4 +1,4 @@
--- Explicit corporate identity revocation and rotation semantics.
+-- Explicit relay-verified identity revocation and rotation semantics.
 --
 -- principal: disables every key for the issuer-qualified principal.
 -- key: revokes only this key; a different key still requires an explicit

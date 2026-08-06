@@ -1,4 +1,4 @@
--- Relay-verified identity bindings.
+-- Relay-verified, community-scoped identity bindings.
 --
 -- This is the relay-side foundation for mapping an issuer-qualified IdP
 -- subject to a Nostr pubkey. It is intentionally not a full grant/session
