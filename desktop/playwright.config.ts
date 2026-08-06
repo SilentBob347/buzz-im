@@ -34,7 +34,6 @@ export default defineConfig({
         "**/hosted-communities-settings-screenshots.spec.ts",
         "**/invites-settings-screenshots.spec.ts",
         "**/messaging.spec.ts",
-        "**/current-binding-status.spec.ts",
         "**/message-feedback-snapshots.spec.ts",
         "**/custom-emoji.spec.ts",
         "**/profile-custom-emoji-status.spec.ts",
