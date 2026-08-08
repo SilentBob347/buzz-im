@@ -338,6 +338,28 @@ impl UsageTracker {
         // setup notifications (no in-flight turn) still advance the baseline.
         let is_in_flight = self.in_flight_session.as_deref() == Some(session_id);
 
+        // Latch poison at observation time — even mid-turn, even for the
+        // in-flight session.  Without this, a second `record()` call in the
+        // same turn would re-read the unchanged session entry (whose
+        // `input_ever_poisoned` is still false), see `prev.last_input = Some(…)`,
+        // and allow the reintroduced value to heal `delta_reliable`.
+        // Writing here is safe: the baseline counters (`last_input` etc.) are
+        // NOT updated — only the monotonic poison flags, which can only grow.
+        // Case 3 (in-flight for another session) is intentionally excluded: we
+        // drop that notification entirely and leave the other session's state
+        // untouched to avoid undercounting its next published delta.
+        let this_in_flight_for_another = self.in_flight_session.is_some() && !is_in_flight;
+        if !this_in_flight_for_another {
+            if let Some(state) = self.sessions.get_mut(session_id) {
+                if current_input.is_none() {
+                    state.input_ever_poisoned = true;
+                }
+                if current_output.is_none() {
+                    state.output_ever_poisoned = true;
+                }
+            }
+        }
+
         let (delta_reliable, turn_input, turn_output, turn_cost, turn_seq) =
             match self.sessions.get(session_id) {
                 None => {
@@ -2497,6 +2519,89 @@ mod tests {
         assert!(
             !t4.delta_reliable,
             "delta_reliable stays false for the remainder of the session"
+        );
+    }
+
+    /// Convenience helper: build a payload with optional input and output.
+    /// Used by within-turn sticky-poison tests that need to inject absence
+    /// mid-turn without building the full struct every time.
+    fn payload_opt(input: Option<u64>, output: Option<u64>) -> UsageUpdatePayload {
+        UsageUpdatePayload {
+            used: 0,
+            context_limit: 0,
+            accumulated_input_tokens: input,
+            accumulated_output_tokens: output,
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        }
+    }
+
+    /// Once ACP observes an absent *input* snapshot mid-turn, a later
+    /// notification in the SAME turn that reintroduces the field must NOT
+    /// heal `delta_reliable`.  The poison must also persist to subsequent turns.
+    ///
+    /// Wes's finding: his reproducer was stated at snapshot level ("a later
+    /// producer snapshot reintroduces the field"), not turn level.  This test
+    /// pins the within-turn case that the turn-boundary latch missed.
+    #[test]
+    fn within_turn_input_absent_then_present_stays_unreliable() {
+        let mut t = UsageTracker::default();
+        t.seed_zero_baseline("wt-input");
+        t.begin_turn("wt-input");
+        // First notification is normal — establishes a seeded baseline turn.
+        t.record("wt-input", &payload_opt(Some(50), Some(10)));
+        let t0 = t.take().expect("t0");
+        assert!(t0.delta_reliable, "pre-poison turn must be reliable");
+
+        t.begin_turn("wt-input");
+        t.record("wt-input", &payload_opt(None, Some(10))); // poison: input absent
+        t.record("wt-input", &payload_opt(Some(100), Some(20))); // reintroduced
+        let t1 = t.take().expect("t1");
+        assert!(
+            !t1.delta_reliable,
+            "within-turn absent→present must stay unreliable (input)"
+        );
+
+        t.begin_turn("wt-input");
+        t.record("wt-input", &payload_opt(Some(150), Some(30)));
+        let t2 = t.take().expect("t2");
+        assert!(
+            !t2.delta_reliable,
+            "poison must persist to next turn (input)"
+        );
+    }
+
+    /// Symmetric to the input case: once ACP observes an absent *output*
+    /// snapshot mid-turn, subsequent same-turn reintroductions and subsequent
+    /// turns must both stay unreliable.
+    #[test]
+    fn within_turn_output_absent_then_present_stays_unreliable() {
+        let mut t = UsageTracker::default();
+        t.seed_zero_baseline("wt-output");
+        t.begin_turn("wt-output");
+        t.record("wt-output", &payload_opt(Some(50), Some(10)));
+        let t0 = t.take().expect("t0");
+        assert!(t0.delta_reliable, "pre-poison turn must be reliable");
+
+        t.begin_turn("wt-output");
+        t.record("wt-output", &payload_opt(Some(60), None)); // poison: output absent
+        t.record("wt-output", &payload_opt(Some(100), Some(20))); // reintroduced
+        let t1 = t.take().expect("t1");
+        assert!(
+            !t1.delta_reliable,
+            "within-turn absent→present must stay unreliable (output)"
+        );
+
+        t.begin_turn("wt-output");
+        t.record("wt-output", &payload_opt(Some(150), Some(30)));
+        let t2 = t.take().expect("t2");
+        assert!(
+            !t2.delta_reliable,
+            "poison must persist to next turn (output)"
         );
     }
 }
