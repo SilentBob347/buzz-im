@@ -390,3 +390,123 @@ fn d6_unknown_sort_value_ranks_last() {
     assert_eq!(series.agents[1].agent_pubkey, "agent_c");
     assert_eq!(series.agents[2].agent_pubkey, "agent_a");
 }
+
+// ── hasUnknownUsage propagation (P4b: Wes's CHANGES_REQUESTED fixes) ─────────
+
+/// Wes's escape (a): `derive_fresh_input()` returns `incomplete: true` when
+/// subsets exceed input, but `hasUnknownUsage` was false because the four
+/// original checked fields (input, output, total, cost) were all complete.
+/// This pins that `hasUnknownUsage` is true at bucket, agent, model, and
+/// top-level-coverage levels whenever derivation fails.
+#[test]
+fn has_unknown_usage_true_when_fresh_input_derivation_fails() {
+    // All four fields that the original has_unknown() checked are complete:
+    // input=100, output=50, total=150, cost=0.01 — no incomplete values there.
+    // But cache_read=60 + cache_write=60 = 120 > input=100 → derive fails.
+    // Before the fix, has_unknown() returned false (none of the four original
+    // fields were incomplete). After the fix it returns true.
+    let r = AgentMetricIndexRow {
+        turn_input_tokens: Some(100),
+        turn_output_tokens: Some(50),
+        turn_total_tokens: Some(150),
+        turn_cost_usd: Some(0.01),
+        turn_cache_read_tokens: Some(60),
+        turn_cache_write_tokens: Some(60),
+        delta_reliable: Some(true),
+        ..row("e1", "agent1", "s1", 1, 0)
+    };
+    let boundaries = boundaries_7();
+    let rows = vec![r];
+    let series = compute_series(&rows, &rows, 0, &boundaries, None, true);
+
+    // Bucket-level flag.
+    assert!(
+        series.buckets[0].has_unknown_usage,
+        "bucket hasUnknownUsage must be true when fresh_input derivation fails"
+    );
+    // Agent-level flag.
+    assert!(
+        series.agents[0].has_unknown_usage,
+        "agent hasUnknownUsage must be true when fresh_input derivation fails"
+    );
+    // Model-level flag.
+    assert!(
+        series.agents[0].models[0].has_unknown_usage,
+        "model hasUnknownUsage must be true when fresh_input derivation fails"
+    );
+    // Top-level coverage flag.
+    assert!(
+        series.coverage.has_unknown_usage,
+        "coverage hasUnknownUsage must be true when fresh_input derivation fails"
+    );
+    // Confirm the fresh_input value reflects the derivation failure.
+    assert_eq!(
+        series.agents[0].usage.fresh_input_tokens,
+        super::UsageField {
+            value: None,
+            incomplete: true,
+        },
+        "fresh_input_tokens must be incomplete when subsets exceed input"
+    );
+}
+
+/// Wes's escape (b): old harness omits cache fields → cache/fresh accumulators
+/// are incomplete while `hasUnknownUsage` was false (the four original checked
+/// fields were complete).  This pins that `hasUnknownUsage` is true whenever
+/// cache fields are absent.
+#[test]
+fn has_unknown_usage_true_when_cache_fields_absent() {
+    // All four fields that the original has_unknown() checked are complete:
+    // input=100, output=50, total=150, cost=0.01 — no incomplete values there.
+    // But cache_read and cache_write are absent (old harness) → cache
+    // accumulators are incomplete → fresh_input is incomplete → has_unknown true.
+    // Before the fix, has_unknown() returned false because input/output/total/cost
+    // were complete. After the fix it returns true (cache accumulators are incomplete).
+    let r = AgentMetricIndexRow {
+        turn_input_tokens: Some(100),
+        turn_output_tokens: Some(50),
+        turn_total_tokens: Some(150),
+        turn_cost_usd: Some(0.01),
+        turn_cache_read_tokens: None,  // absent — old harness
+        turn_cache_write_tokens: None, // absent — old harness
+        delta_reliable: Some(true),
+        ..row("e1", "agent1", "s1", 1, 0)
+    };
+    let boundaries = boundaries_7();
+    let rows = vec![r];
+    let series = compute_series(&rows, &rows, 0, &boundaries, None, true);
+
+    // Bucket-level flag.
+    assert!(
+        series.buckets[0].has_unknown_usage,
+        "bucket hasUnknownUsage must be true when cache fields absent"
+    );
+    // Agent-level flag.
+    assert!(
+        series.agents[0].has_unknown_usage,
+        "agent hasUnknownUsage must be true when cache fields absent"
+    );
+    // Model-level flag.
+    assert!(
+        series.agents[0].models[0].has_unknown_usage,
+        "model hasUnknownUsage must be true when cache fields absent"
+    );
+    // Top-level coverage flag.
+    assert!(
+        series.coverage.has_unknown_usage,
+        "coverage hasUnknownUsage must be true when cache fields absent"
+    );
+    // Sanity: the cache and fresh_input fields are all incomplete.
+    assert!(
+        series.agents[0].usage.cache_read_tokens.incomplete,
+        "cache_read_tokens must be incomplete when absent"
+    );
+    assert!(
+        series.agents[0].usage.cache_write_tokens.incomplete,
+        "cache_write_tokens must be incomplete when absent"
+    );
+    assert!(
+        series.agents[0].usage.fresh_input_tokens.incomplete,
+        "fresh_input_tokens must be incomplete when cache fields absent"
+    );
+}

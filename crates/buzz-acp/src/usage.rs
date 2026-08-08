@@ -149,11 +149,10 @@ struct SessionState {
     published_seq: u64,
     /// Cumulative input tokens at the end of the LAST PUBLISHED turn.
     /// Advanced only on publish (i.e. in `take()`), not on every notification.
-    /// `None` when the publisher omitted the field (overflow-poisoned) — any
-    /// subsequent snapshot will also be absent, so no delta is ever possible.
+    /// `None` when the publisher omitted the field in a prior turn.
     last_input: Option<u64>,
     /// Cumulative output tokens at the end of the LAST PUBLISHED turn.
-    /// Same overflow-absent contract as `last_input`.
+    /// `None` when the publisher omitted the field in a prior turn.
     last_output: Option<u64>,
     /// Cumulative cost at the end of the LAST PUBLISHED turn.
     last_cost: Option<f64>,
@@ -171,6 +170,15 @@ struct SessionState {
     /// `None` when the harness has never reported this field. Field-local:
     /// a decrease taints only the cache-write delta, not `delta_reliable`.
     last_cache_write: Option<u64>,
+    /// Sticky poison flag for the input field: set the first time ACP observes
+    /// an absent `accumulated_input_tokens` snapshot for this session and never
+    /// cleared.  Once true, `delta_reliable` stays false for every subsequent
+    /// turn regardless of whether the publisher later resumes emitting the
+    /// field.  ACP cannot trust the producer's permanence guarantee.
+    input_ever_poisoned: bool,
+    /// Sticky poison flag for the output field: same contract as
+    /// `input_ever_poisoned` but for `accumulated_output_tokens`.
+    output_ever_poisoned: bool,
 }
 
 /// Per-turn usage record exposed to `TurnCompletionGuard` for NIP-AM publishing.
@@ -341,44 +349,54 @@ impl UsageTracker {
                     // *published* seq — constant for all notifications in this
                     // turn, advanced only on publish.
                     let seq = prev.published_seq + 1;
-                    // Absent input or output (publisher overflow-poisoned) →
-                    // unreliable delta; not advancing is correct since publisher
-                    // poison is permanent and subsequent snapshots will also be absent.
-                    match (
-                        current_input,
-                        current_output,
-                        prev.last_input,
-                        prev.last_output,
-                    ) {
-                        (Some(ci), Some(co), Some(pi), Some(po)) => {
-                            // Token counter decrease → unreliable delta.
-                            if ci < pi || co < po {
-                                (false, None, None, None, seq)
-                            } else {
-                                let di = ci - pi;
-                                let dout = co - po;
-                                // Cost delta: only when both snapshots have cost.
-                                // A cost *decrease* is also unreliable (NIP-AM: negative
-                                // delta ⇒ delta_reliable false, null all turn fields).
-                                let (dc, cost_reliable) = match (current_cost, prev.last_cost) {
-                                    (Some(c), Some(p)) if c >= p => (Some(c - p), true),
-                                    (Some(_), Some(_)) => {
-                                        // Both present but current < prev — counter decreased.
-                                        (None, false)
-                                    }
-                                    _ => (None, true), // absent on either side: null cost, reliable tokens
-                                };
-                                if cost_reliable {
-                                    (true, Some(di), Some(dout), dc, seq)
-                                } else {
-                                    // Cost decrease overrides the whole record to unreliable.
+                    // Sticky-poison check: if ACP ever observed an absent input
+                    // or output snapshot for this session, delta_reliable is
+                    // permanently false.  A later reintroduced value must NOT
+                    // heal the reliability — ACP cannot trust the producer's
+                    // permanence guarantee; the prefix delta is irrecoverably
+                    // unknown.
+                    let this_input_absent = current_input.is_none();
+                    let this_output_absent = current_output.is_none();
+                    let input_poisoned = prev.input_ever_poisoned || this_input_absent;
+                    let output_poisoned = prev.output_ever_poisoned || this_output_absent;
+                    if input_poisoned || output_poisoned {
+                        (false, None, None, None, seq)
+                    } else {
+                        match (
+                            current_input,
+                            current_output,
+                            prev.last_input,
+                            prev.last_output,
+                        ) {
+                            (Some(ci), Some(co), Some(pi), Some(po)) => {
+                                // Token counter decrease → unreliable delta.
+                                if ci < pi || co < po {
                                     (false, None, None, None, seq)
+                                } else {
+                                    let di = ci - pi;
+                                    let dout = co - po;
+                                    // Cost delta: only when both snapshots have cost.
+                                    // A cost *decrease* is also unreliable (NIP-AM: negative
+                                    // delta ⇒ delta_reliable false, null all turn fields).
+                                    let (dc, cost_reliable) = match (current_cost, prev.last_cost) {
+                                        (Some(c), Some(p)) if c >= p => (Some(c - p), true),
+                                        (Some(_), Some(_)) => {
+                                            // Both present but current < prev — counter decreased.
+                                            (None, false)
+                                        }
+                                        _ => (None, true), // absent on either side: null cost, reliable tokens
+                                    };
+                                    if cost_reliable {
+                                        (true, Some(di), Some(dout), dc, seq)
+                                    } else {
+                                        // Cost decrease overrides the whole record to unreliable.
+                                        (false, None, None, None, seq)
+                                    }
                                 }
                             }
+                            // One or both sides absent (no prior baseline) → unreliable.
+                            _ => (false, None, None, None, seq),
                         }
-                        // One or both sides absent (publisher-poisoned or no prior baseline) →
-                        // unreliable. Not advancing is fine — publisher poison is permanent.
-                        _ => (false, None, None, None, seq),
                     }
                 }
             };
@@ -475,6 +493,13 @@ impl UsageTracker {
             // in-flight turn computes its delta from this notification.
             // This handles setup notifications that fire during `session/new`
             // before the first `begin_turn`.
+            //
+            // Carry forward any existing sticky-poison flags (they only grow).
+            let existing = self.sessions.get(session_id);
+            let input_ever_poisoned =
+                existing.is_some_and(|s| s.input_ever_poisoned) || current_input.is_none();
+            let output_ever_poisoned =
+                existing.is_some_and(|s| s.output_ever_poisoned) || current_output.is_none();
             self.sessions.insert(
                 session_id.to_string(),
                 SessionState {
@@ -488,6 +513,8 @@ impl UsageTracker {
                     last_total: current_total,
                     last_cached_input: current_cached_input,
                     last_cache_write: current_cache_write,
+                    input_ever_poisoned,
+                    output_ever_poisoned,
                 },
             );
         }
@@ -528,6 +555,10 @@ impl UsageTracker {
                 last_total: Some(0),
                 last_cached_input: Some(0),
                 last_cache_write: Some(0),
+                // A freshly-spawned session has no prior absence — poison flags
+                // start clear and are set only if a subsequent snapshot is absent.
+                input_ever_poisoned: false,
+                output_ever_poisoned: false,
             });
     }
 
@@ -548,6 +579,13 @@ impl UsageTracker {
         record.pricing_identity = folded_identity;
         // Advance the committed baseline to this published record so the
         // *next* turn measures its delta from here.
+        // Propagate the sticky-poison flags from the existing state: once
+        // poisoned, always poisoned — a resumed emission cannot heal the gap.
+        let existing = self.sessions.get(&record.session_id);
+        let input_ever_poisoned = existing.is_some_and(|s| s.input_ever_poisoned)
+            || record.cumulative_input_tokens.is_none();
+        let output_ever_poisoned = existing.is_some_and(|s| s.output_ever_poisoned)
+            || record.cumulative_output_tokens.is_none();
         self.sessions.insert(
             record.session_id.clone(),
             SessionState {
@@ -558,6 +596,8 @@ impl UsageTracker {
                 last_total: record.cumulative_total_tokens,
                 last_cached_input: record.cumulative_cache_read_tokens,
                 last_cache_write: record.cumulative_cache_write_tokens,
+                input_ever_poisoned,
+                output_ever_poisoned,
             },
         );
         Some(record)
@@ -2341,6 +2381,122 @@ mod tests {
         assert!(
             t3.cumulative_input_tokens.is_none(),
             "turn after poison: cumulative_input_tokens stays None"
+        );
+    }
+
+    /// Wes's P1 reproducer: once ACP has observed an absent input cumulative,
+    /// a later turn that resumes emitting the field must NOT heal
+    /// `delta_reliable`.  The prefix delta is irrecoverably unknown; sticky
+    /// poison persists for the rest of the session.
+    #[test]
+    fn sticky_poison_input_absent_then_present_stays_unreliable() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-sticky-input");
+
+        // Turn 1: normal — establishes a baseline.
+        tracker.begin_turn("sess-sticky-input");
+        tracker.record("sess-sticky-input", &payload(500, 100, None));
+        let t1 = tracker.take().expect("t1");
+        assert!(t1.delta_reliable, "pre-poison turn must be reliable");
+
+        // Turn 2: publisher poisons (absent input).
+        tracker.begin_turn("sess-sticky-input");
+        let poisoned = UsageUpdatePayload {
+            used: 0,
+            context_limit: 0,
+            accumulated_input_tokens: None,
+            accumulated_output_tokens: Some(300),
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        };
+        tracker.record("sess-sticky-input", &poisoned);
+        let t2 = tracker.take().expect("t2");
+        assert!(!t2.delta_reliable, "poisoned turn must be unreliable");
+
+        // Turn 3: publisher resumes emitting input — but poison must be sticky.
+        tracker.begin_turn("sess-sticky-input");
+        tracker.record("sess-sticky-input", &payload(100, 400, None));
+        let t3 = tracker.take().expect("t3");
+        assert!(
+            !t3.delta_reliable,
+            "turn after absent→present must stay unreliable (sticky poison)"
+        );
+        assert!(
+            t3.turn_input_tokens.is_none(),
+            "turn_input_tokens must be None after sticky poison"
+        );
+        assert!(
+            t3.turn_output_tokens.is_none(),
+            "turn_output_tokens must be None after sticky poison"
+        );
+
+        // Turn 4: publisher continues emitting — poison persists.
+        tracker.begin_turn("sess-sticky-input");
+        tracker.record("sess-sticky-input", &payload(150, 500, None));
+        let t4 = tracker.take().expect("t4");
+        assert!(
+            !t4.delta_reliable,
+            "delta_reliable stays false for the remainder of the session"
+        );
+    }
+
+    /// Symmetric to the input test: once ACP has observed an absent *output*
+    /// cumulative, subsequent turns that resume emitting output must NOT heal
+    /// `delta_reliable`.
+    #[test]
+    fn sticky_poison_output_absent_then_present_stays_unreliable() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-sticky-output");
+
+        // Turn 1: normal.
+        tracker.begin_turn("sess-sticky-output");
+        tracker.record("sess-sticky-output", &payload(500, 100, None));
+        let t1 = tracker.take().expect("t1");
+        assert!(t1.delta_reliable);
+
+        // Turn 2: absent output poisons the session.
+        tracker.begin_turn("sess-sticky-output");
+        let poisoned = UsageUpdatePayload {
+            used: 0,
+            context_limit: 0,
+            accumulated_input_tokens: Some(600),
+            accumulated_output_tokens: None, // <-- absent output
+            accumulated_cached_input_tokens: None,
+            accumulated_cache_write_tokens: None,
+            accumulated_cost: None,
+            accumulated_total_tokens: None,
+            model: None,
+            pricing_identity: None,
+        };
+        tracker.record("sess-sticky-output", &poisoned);
+        let t2 = tracker.take().expect("t2");
+        assert!(
+            !t2.delta_reliable,
+            "absent output must make delta unreliable"
+        );
+
+        // Turn 3: output resumes — sticky poison holds.
+        tracker.begin_turn("sess-sticky-output");
+        tracker.record("sess-sticky-output", &payload(700, 200, None));
+        let t3 = tracker.take().expect("t3");
+        assert!(
+            !t3.delta_reliable,
+            "output absent→present must stay unreliable (sticky poison)"
+        );
+        assert!(t3.turn_input_tokens.is_none());
+        assert!(t3.turn_output_tokens.is_none());
+
+        // Turn 4: persists.
+        tracker.begin_turn("sess-sticky-output");
+        tracker.record("sess-sticky-output", &payload(800, 250, None));
+        let t4 = tracker.take().expect("t4");
+        assert!(
+            !t4.delta_reliable,
+            "delta_reliable stays false for the remainder of the session"
         );
     }
 }

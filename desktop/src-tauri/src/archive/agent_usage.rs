@@ -474,6 +474,38 @@ impl UsageAccumulator {
             || self.output.has_unknown()
             || self.total.has_unknown()
             || self.cost.has_unknown()
+            || self.cache_read.has_unknown()
+            || self.cache_write.has_unknown()
+            || self.fresh_input_incomplete()
+    }
+
+    /// Returns true when `derive_fresh_input()` would produce `incomplete: true`.
+    ///
+    /// Mirrors the fail-closed conditions of `derive_fresh_input()` without
+    /// consuming `self`, so `has_unknown()` can be called before `finish()` at
+    /// all six call sites.  The two functions must stay in sync.
+    fn fresh_input_incomplete(&self) -> bool {
+        // Input unknown or incomplete → fresh_input incomplete.
+        if self.input.incomplete {
+            return true;
+        }
+        // No input events at all (value = None, not incomplete) → no fresh_input
+        // to derive; not a failure, not incomplete.
+        let Some(input) = self.input.value else {
+            return false;
+        };
+        // Any cache accumulator incomplete → fresh_input incomplete.
+        if self.cache_read.incomplete || self.cache_write.incomplete {
+            return true;
+        }
+        let cache_read = self.cache_read.value.unwrap_or(0);
+        let cache_write = self.cache_write.value.unwrap_or(0);
+        // Subset sum overflow → incomplete.
+        let Some(subset_sum) = cache_read.checked_add(cache_write) else {
+            return true;
+        };
+        // Subsets exceed input → incomplete.
+        input < subset_sum
     }
 
     /// D6 sort value: provider `totalTokens` when known, else `input+output`
